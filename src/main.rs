@@ -1,4 +1,5 @@
 mod filters;
+mod hevc;
 mod misc;
 pub mod parser;
 pub mod presets;
@@ -24,6 +25,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 use crossterm::tty::IsTty;
 use dialoguer::Confirm;
 use ffmpeg::{
+    codec,
     ffi::{AVColorRange, AVColorTransferCharacteristic},
     format,
 };
@@ -173,6 +175,25 @@ pub fn main() -> Result<()> {
             }
 
             let reader = BitstreamReader::open(&input)?;
+            if reader.get_video_stream()?.parameters().id() == codec::Id::HEVC {
+                let grain_tables = hevc::inspect_hevc_grain_table(&input)?;
+                if grain_tables.is_empty() {
+                    info!(
+                        "No x265 AFGS1 film grain SEI found--this video does not use supported HEVC grain synthesis"
+                    );
+                    return Ok(());
+                }
+
+                let mut output_file = BufWriter::new(File::create(&output)?);
+                writeln!(&mut output_file, "filmgrn1")?;
+                for segment in grain_tables {
+                    write_film_grain_segment(&segment, &mut output_file)?;
+                }
+                output_file.flush()?;
+
+                info!("Done, wrote grain table to {}", output.to_string_lossy());
+                return Ok(());
+            }
             let frame_rate = reader.get_video_details().frame_rate;
             let mut parser: BitstreamParser<false> = BitstreamParser::new(reader);
             let grain_headers = parser.get_grain_headers()?;
@@ -229,25 +250,27 @@ pub fn main() -> Result<()> {
                 return Ok(());
             }
 
-            // Check whether the input already carries film grain headers.
-            // We only need to read the Sequence Header OBU (always in the first video packet)
-            // to check the film_grain_params_present flag, so this is effectively instant.
-            let check_reader = BitstreamReader::open(&input)?;
-            let mut check_parser: BitstreamParser<false> = BitstreamParser::new(check_reader);
-            let has_existing_grain = check_parser.film_grain_params_present()?;
+            let reader = BitstreamReader::open(&input)?;
+            let codec_id = reader.get_video_stream()?.parameters().id();
 
-            if has_existing_grain && !replace {
-                info!(
-                    "Skipped: grain headers already exist in this file. Re-run with '--replace' \
-                     to replace the existing grain headers."
-                );
-                return Ok(());
+            if codec_id != codec::Id::HEVC {
+                // Check whether the input already carries AV1 film grain headers.
+                // We only need to read the Sequence Header OBU (always in the first video packet)
+                // to check the film_grain_params_present flag, so this is effectively instant.
+                let check_reader = BitstreamReader::open(&input)?;
+                let mut check_parser: BitstreamParser<false> = BitstreamParser::new(check_reader);
+                let has_existing_grain = check_parser.film_grain_params_present()?;
+
+                if has_existing_grain && !replace {
+                    info!(
+                        "Skipped: grain headers already exist in this file. Re-run with '--replace' \
+                         to replace the existing grain headers."
+                    );
+                    return Ok(());
+                }
             }
 
             // Build the grain segments from whichever source was provided.
-            let reader = BitstreamReader::open(&input)?;
-            let writer = format::output(&output)?;
-
             let new_grain = match (grain, preset, iso) {
                 (Some(grain_path), None, None) => {
                     let grain_data = read_to_string(grain_path)?;
@@ -325,6 +348,21 @@ pub fn main() -> Result<()> {
                 ),
             };
 
+            if codec_id == codec::Id::HEVC {
+                if !replace && hevc::has_hevc_grain(&input)? {
+                    info!(
+                        "Skipped: HEVC stream already contains x265 AFGS1 SEI. Re-run with \
+                         '--replace' to replace the existing grain SEI."
+                    );
+                    return Ok(());
+                }
+                hevc::modify_hevc_grain(&input, &output, new_grain.as_deref(), replace)?;
+                info!("Done, wrote output file to {}", output.to_string_lossy());
+                return Ok(());
+            }
+
+            let writer = format::output(&output)?;
+
             let mut parser: BitstreamParser<true> =
                 BitstreamParser::with_writer(reader, writer, new_grain);
 
@@ -393,6 +431,11 @@ pub fn main() -> Result<()> {
             }
 
             let reader = BitstreamReader::open(&input)?;
+            if reader.get_video_stream()?.parameters().id() == codec::Id::HEVC {
+                hevc::modify_hevc_grain(&input, &output, None, true)?;
+                info!("Done, wrote output file to {}", output.to_string_lossy());
+                return Ok(());
+            }
             let writer = format::output(&output)?;
             let mut parser: BitstreamParser<true> =
                 BitstreamParser::with_writer(reader, writer, None);
@@ -1067,7 +1110,7 @@ fn aggregate_grain_headers(
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Grain synth analyzer and editor for AV1 files",
+    about = "Grain synth analyzer and editor for AV1 and HEVC files",
     version,
     flatten_help = true
 )]
@@ -1078,11 +1121,11 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Read the film grain table from an AV1 video and write it to a file.
+    /// Read the film grain table from an AV1 or HEVC video and write it to a file.
     ///
     /// Reports if the video has no film grain synthesis enabled.
     Inspect {
-        /// The AV1 file to inspect.
+        /// The AV1 or HEVC file to inspect.
         #[clap(value_parser)]
         input: PathBuf,
         /// The path to write the film grain table to.
@@ -1093,7 +1136,7 @@ pub enum Commands {
         overwrite: bool,
     },
     /// Applies film grain from a provided grain-table, a built-in preset, or generated
-    /// photon-noise-based grain to a given AV1 video and outputs it at a given `output` path.
+    /// photon-noise-based grain to a given AV1 or HEVC video and outputs it at a given `output` path.
     ///
     /// Exactly one grain source must be provided:
     ///   --grain <FILE>     apply grain from a table file
@@ -1108,10 +1151,10 @@ pub enum Commands {
             .args(["grain", "preset", "iso"])
     ))]
     Apply {
-        /// The AV1 file to apply grain to.
+        /// The AV1 or HEVC file to apply grain to.
         #[clap(value_parser)]
         input: PathBuf,
-        /// The path to write the grain-synthed AV1 file to.
+        /// The path to write the grain-synthed AV1 or HEVC file to.
         #[clap(long, short, value_parser)]
         output: PathBuf,
         /// Overwrite the output file without prompting.
@@ -1140,9 +1183,9 @@ pub enum Commands {
     },
     /// List all built-in film grain presets that can be used with `apply --preset`.
     Presets,
-    /// Strip all film grain synthesis from an AV1 video.
+    /// Strip all supported film grain synthesis from an AV1 or HEVC video.
     Remove {
-        /// The AV1 file to remove grain from.
+        /// The AV1 or HEVC file to remove grain from.
         #[clap(value_parser)]
         input: PathBuf,
         /// The path to write the grain-free AV1 file to.

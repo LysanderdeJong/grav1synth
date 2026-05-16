@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/grav1synth?style=for-the-badge)](https://crates.io/crates/grav1synth)
 [![LICENSE](https://img.shields.io/crates/l/grav1synth?style=for-the-badge)](https://github.com/rust-av/grav1synth/blob/main/LICENSE)
 
-Grain Synth analyzer and editor for AV1 files
+Grain Synth analyzer and editor for AV1 files, with HEVC/x265 AFGS1 SEI injection support.
 
 ## Build
 
@@ -19,21 +19,51 @@ Grain Synth analyzer and editor for AV1 files
 
 ### `grav1synth inspect my_encode.mkv -o grain_file.txt`
 
-Reads `my_encode.mkv` and outputs a film grain table file at `grain_file.txt`
+Reads `my_encode.mkv` and outputs a film grain table file at `grain_file.txt`.
+
+For AV1 inputs this reads AV1 film grain headers. For HEVC inputs this reads x265 AFGS1 film grain SEI messages.
 
 ### `grav1synth apply my_encode.mkv -o grainy_encode.mkv -g grain_file.txt`
 
 Reads `my_encode.mkv`, applies film grain from `grain_file.txt`, and outputs the video to `grainy_encode.mkv`.
 
+For AV1 inputs this edits AV1 film grain headers. For HEVC inputs this injects x265-compatible AFGS1 prefix SEI messages without re-encoding the video.
+
 ### `grav1synth apply my_encode.mkv -o grainy_encode.mkv --iso 400 --chroma`
 
 Reads `my_encode.mkv`, generates photon-noise-based film grain at the strength given by `--iso` (up to `4294967295`), and outputs the video to `grainy_encode.mkv`. By default grain is applied to the luma plane only; `--chroma` enables grain on chroma planes as well.
 
-In both forms, if the input already has film grain headers the command will print a notice and skip processing — add `--replace` to overwrite existing grain instead. This makes it safe to use in automated workflows where you want to protect videos that already have grain while still applying grain to those that do not.
+In both forms, if the input already has supported film grain metadata the command will print a notice and skip processing — add `--replace` to overwrite existing grain instead. This makes it safe to use in automated workflows where you want to protect videos that already have grain while still applying grain to those that do not.
 
 ### `grav1synth remove my_encode.mkv -o clean_encode.mkv`
 
-Reads `my_encode.mkv`, removes all synthesized film grain, and outputs the video at `clean_encode.mkv`
+Reads `my_encode.mkv`, removes all supported synthesized film grain metadata, and outputs the video at `clean_encode.mkv`.
+
+For AV1 inputs this removes AV1 film grain headers. For HEVC inputs this removes x265 AFGS1 film grain SEI messages.
+
+### HEVC/x265 post-encode workflow
+
+If you already have an x265/HEVC encode, you can add decoder-side grain metadata without re-encoding:
+
+```sh
+grav1synth apply existing_x265.mkv -o existing_x265_with_grain.mkv --grain grain_file.txt
+```
+
+Inspect the injected grain table:
+
+```sh
+grav1synth inspect existing_x265_with_grain.mkv -o extracted_grain.txt
+```
+
+Remove the injected SEI again:
+
+```sh
+grav1synth remove existing_x265_with_grain.mkv -o existing_x265_without_grain.mkv
+```
+
+An apply/remove roundtrip preserves the original raw HEVC elementary stream byte-for-byte; only the AFGS1 SEI messages are added or removed.
+
+Supported HEVC grain metadata is x265's AFGS1 `USER_DATA_REGISTERED_ITU_T_T35` prefix SEI format. Unsupported AFGS1 variants such as predictive scaling may not inspect back to `filmgrn1` yet.
 
 ### `grav1synth diff my_source.mkv denoised_source.mkv -o grain_file.txt`
 
