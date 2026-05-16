@@ -31,6 +31,7 @@ use indicatif::{HumanDuration, ProgressBar, ProgressDrawTarget, ProgressState, P
 use log::{debug, error, info, warn};
 use num_rational::Rational32;
 use parser::grain::{FilmGrainHeader, FilmGrainParams};
+use rayon::ThreadPoolBuilder;
 
 use crate::{
     filters::FilterChain, misc::get_frame_count, parser::BitstreamParser, reader::BitstreamReader,
@@ -305,9 +306,7 @@ pub fn main() -> Result<()> {
                             iso_setting: iso_value,
                             width,
                             height,
-                            transfer_function: if trc
-                                == AVColorTransferCharacteristic::SMPTE2084
-                            {
+                            transfer_function: if trc == AVColorTransferCharacteristic::SMPTE2084 {
                                 TransferFunction::SMPTE2084
                             } else {
                                 TransferFunction::BT1886
@@ -408,6 +407,7 @@ pub fn main() -> Result<()> {
             output,
             overwrite,
             filters,
+            threads,
         } => {
             if source == output || denoised == output {
                 error!(
@@ -436,6 +436,15 @@ pub fn main() -> Result<()> {
                 }
                 None => None,
             };
+
+            if let Some(threads) = threads {
+                if threads == 0 {
+                    bail!("--threads must be greater than zero");
+                }
+                ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build_global()?;
+            }
 
             if output.exists()
                 && !overwrite
@@ -588,6 +597,82 @@ pub fn main() -> Result<()> {
             output_file.flush()?;
             info!("Computed diff for {frames} frames");
             info!("Done, wrote output file to {}", output.to_string_lossy());
+        }
+        Commands::X265Aom {
+            grain,
+            output,
+            overwrite,
+            video,
+            frames,
+            fps,
+        } => {
+            if grain == output {
+                error!(
+                    "Input and output paths are the same. This is probably a typo, because this \
+                     would overwrite your input. Exiting."
+                );
+                return Ok(());
+            }
+
+            if output.exists()
+                && !overwrite
+                && !Confirm::new()
+                    .with_prompt(format!(
+                        "File {} exists. Overwrite?",
+                        output.to_string_lossy()
+                    ))
+                    .interact()?
+            {
+                warn!("Not overwriting existing file. Exiting.");
+                return Ok(());
+            }
+
+            let grain_data = read_to_string(&grain)?;
+            let grain_segments = parse_grain_table(&grain_data)?
+                .into_iter()
+                .map(GrainTableSegment::from)
+                .collect::<Vec<_>>();
+
+            if grain_segments.is_empty() {
+                bail!("Grain table does not contain any enabled grain segments");
+            }
+
+            let (frame_count, frame_rate) = match (video, frames, fps) {
+                (Some(video), None, None) => {
+                    let frame_count = get_frame_count(&video)?;
+                    let reader = BitstreamReader::open(&video)?;
+                    (frame_count, Some(reader.get_video_details().frame_rate))
+                }
+                (None, Some(frame_count), fps) => {
+                    let frame_rate = fps.as_deref().map(parse_fps).transpose()?;
+                    (frame_count, frame_rate)
+                }
+                (Some(_), Some(_), _) => {
+                    bail!("Use either --video or --frames, not both");
+                }
+                (Some(_), None, Some(_)) => {
+                    bail!("--fps is only valid with --frames; --video already provides FPS");
+                }
+                (None, None, _) => {
+                    bail!("Provide --video to infer frame count/FPS, or --frames manually");
+                }
+            };
+
+            if frame_count == 0 {
+                bail!("Frame count must be greater than zero");
+            }
+            if grain_segments.len() > 1 && frame_rate.is_none() {
+                bail!("Multi-segment grain tables require --video or --fps to map timestamps");
+            }
+
+            let mut output_file = BufWriter::new(File::create(&output)?);
+            write_x265_aom_file(&grain_segments, frame_count, frame_rate, &mut output_file)?;
+            output_file.flush()?;
+
+            info!(
+                "Done, wrote {frame_count} x265 AOM grain record(s) to {}",
+                output.to_string_lossy()
+            );
         }
         #[cfg(feature = "unstable")]
         Commands::Estimate {
@@ -753,6 +838,157 @@ fn write_film_grain_segment(
     Ok(())
 }
 
+fn write_x265_aom_file<W: Write>(
+    segments: &[GrainTableSegment],
+    frame_count: usize,
+    frame_rate: Option<Rational32>,
+    output: &mut W,
+) -> anyhow::Result<()> {
+    if segments.len() == 1 {
+        let params = &segments[0].grain_params;
+        for _ in 0..frame_count {
+            write_x265_aom_record(Some(params), output)?;
+        }
+        return Ok(());
+    }
+
+    let frame_rate = frame_rate.ok_or_else(|| anyhow!("Frame rate is required"))?;
+    let time_per_frame =
+        *frame_rate.denom() as f64 / *frame_rate.numer() as f64 * TIMESTAMP_BASE_UNIT;
+
+    for frame in 0..frame_count {
+        let timestamp = (frame as f64 * time_per_frame).floor() as u64;
+        let params = segments
+            .iter()
+            .find(|segment| segment.start_time <= timestamp && timestamp < segment.end_time)
+            .map(|segment| &segment.grain_params);
+        write_x265_aom_record(params, output)?;
+    }
+
+    Ok(())
+}
+
+fn write_x265_aom_record<W: Write>(
+    params: Option<&FilmGrainParams>,
+    output: &mut W,
+) -> anyhow::Result<()> {
+    let Some(params) = params else {
+        write_i32_le(output, 0)?; // apply_grain
+        write_u16_le(output, 0)?; // grain_seed
+        write_i32_le(output, 0)?; // update_grain
+        write_i32_le(output, 0)?; // num_y_points
+        write_i32_le(output, 0)?; // num_cb_points
+        write_i32_le(output, 0)?; // num_cr_points
+        write_i32_le(output, 0)?; // scaling_shift
+        write_i32_le(output, 0)?; // ar_coeff_lag
+        write_i32_le(output, 0)?; // ar_coeff_shift
+        write_i32_le(output, 0)?; // grain_scale_shift
+        write_i32_le(output, 0)?; // overlap_flag
+        write_i32_le(output, 0)?; // clip_to_restricted_range
+        return Ok(());
+    };
+
+    if params.chroma_scaling_from_luma {
+        bail!(
+            "x265's --aom-film-grain reader does not consume chroma_scaling_from_luma records; \
+             generate or edit the grain table with explicit Cb/Cr scaling points"
+        );
+    }
+
+    write_i32_le(output, 1)?; // apply_grain
+    write_u16_le(output, params.grain_seed)?;
+    write_i32_le(output, 1)?; // update_grain
+
+    write_points(output, &params.scaling_points_y)?;
+    write_points(output, &params.scaling_points_cb)?;
+    write_points(output, &params.scaling_points_cr)?;
+
+    write_i32_le(output, i32::from(params.scaling_shift))?;
+    write_i32_le(output, i32::from(params.ar_coeff_lag))?;
+
+    if !params.scaling_points_y.is_empty() {
+        write_coeffs(output, params.ar_coeffs_y.iter().copied(), 24)?;
+    }
+    if !params.scaling_points_cb.is_empty() {
+        write_coeffs(output, params.ar_coeffs_cb.iter().copied(), 25)?;
+    }
+    if !params.scaling_points_cr.is_empty() {
+        write_coeffs(output, params.ar_coeffs_cr.iter().copied(), 25)?;
+    }
+
+    write_i32_le(output, i32::from(params.ar_coeff_shift))?;
+    write_i32_le(output, i32::from(params.grain_scale_shift))?;
+
+    if !params.scaling_points_cb.is_empty() {
+        write_i32_le(output, i32::from(params.cb_mult))?;
+        write_i32_le(output, i32::from(params.cb_luma_mult))?;
+        write_i32_le(output, i32::from(params.cb_offset))?;
+    }
+    if !params.scaling_points_cr.is_empty() {
+        write_i32_le(output, i32::from(params.cr_mult))?;
+        write_i32_le(output, i32::from(params.cr_luma_mult))?;
+        write_i32_le(output, i32::from(params.cr_offset))?;
+    }
+
+    write_i32_le(output, i32::from(params.overlap_flag))?;
+    write_i32_le(output, i32::from(params.clip_to_restricted_range))?;
+
+    Ok(())
+}
+
+fn write_points<W: Write>(output: &mut W, points: &[[u8; 2]]) -> anyhow::Result<()> {
+    write_i32_le(output, points.len().try_into()?)?;
+    for point in points {
+        write_i32_le(output, i32::from(point[0]))?;
+        write_i32_le(output, i32::from(point[1]))?;
+    }
+    Ok(())
+}
+
+fn write_coeffs<W: Write>(
+    output: &mut W,
+    coeffs: impl IntoIterator<Item = i8>,
+    count: usize,
+) -> anyhow::Result<()> {
+    let mut written = 0usize;
+    for coeff in coeffs.into_iter().take(count) {
+        write_i32_le(output, i32::from(coeff))?;
+        written += 1;
+    }
+    for _ in written..count {
+        write_i32_le(output, 0)?;
+    }
+    Ok(())
+}
+
+fn write_i32_le<W: Write>(output: &mut W, value: i32) -> anyhow::Result<()> {
+    output.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_u16_le<W: Write>(output: &mut W, value: u16) -> anyhow::Result<()> {
+    output.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn parse_fps(value: &str) -> anyhow::Result<Rational32> {
+    if let Some((numer, denom)) = value.split_once('/') {
+        let numer = numer.parse::<i32>()?;
+        let denom = denom.parse::<i32>()?;
+        if numer <= 0 || denom <= 0 {
+            bail!("FPS numerator and denominator must be positive");
+        }
+        return Ok(Rational32::new(numer, denom));
+    }
+
+    let fps = value.parse::<f64>()?;
+    if !fps.is_finite() || fps <= 0.0 {
+        bail!("FPS must be positive");
+    }
+
+    Ok(Rational32::new((fps * 1000.0).round() as i32, 1000))
+}
+
 #[derive(Debug, Clone)]
 pub struct GrainTableSegment {
     pub start_time: u64,
@@ -833,7 +1069,7 @@ fn aggregate_grain_headers(
 #[command(
     about = "Grain synth analyzer and editor for AV1 files",
     version,
-    flatten_help = true,
+    flatten_help = true
 )]
 pub struct Args {
     #[clap(subcommand)]
@@ -945,6 +1181,37 @@ pub enum Commands {
         ///     Default is "catmullrom"
         #[clap(long, short, verbatim_doc_comment)]
         filters: Option<String>,
+        /// Number of Rayon worker threads to use for grain analysis.
+        /// Defaults to Rayon's normal thread count when omitted.
+        #[clap(long)]
+        threads: Option<usize>,
+    },
+    /// Convert a `filmgrn1` table into x265's binary `--aom-film-grain` input.
+    ///
+    /// x265 reads one binary grain record for every encoded frame, so this command
+    /// expands timestamped grain-table segments to per-frame records. Provide
+    /// --video to infer frame count and FPS from the encoded input, or use
+    /// --frames and optionally --fps manually.
+    X265Aom {
+        /// The `filmgrn1` grain table to convert.
+        #[clap(value_parser)]
+        grain: PathBuf,
+        /// The path to write the x265 AOM film-grain binary file to.
+        #[clap(long, short, value_parser)]
+        output: PathBuf,
+        /// Overwrite the output file without prompting.
+        #[clap(long, short = 'y')]
+        overwrite: bool,
+        /// Video whose frame count and FPS should be used for per-frame expansion.
+        #[clap(long, value_parser)]
+        video: Option<PathBuf>,
+        /// Number of x265 grain records to write. Use when --video is unavailable.
+        #[clap(long, value_parser)]
+        frames: Option<usize>,
+        /// Frame rate used to map multi-segment grain tables when --frames is used.
+        /// Accepts ratios like 24000/1001 or decimal values like 23.976.
+        #[clap(long, requires = "frames")]
+        fps: Option<String>,
     },
     /// Analyzes a source video and estimates the amount of noise in the source,
     /// then generates an appropriate film grain table. This is less accurate
@@ -964,4 +1231,45 @@ pub enum Commands {
         #[clap(long)]
         chroma: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_fps_accepts_ratio() {
+        let fps = parse_fps("24000/1001").expect("valid fps");
+        assert_eq!(*fps.numer(), 24000);
+        assert_eq!(*fps.denom(), 1001);
+    }
+
+    #[test]
+    fn x265_aom_writer_expands_single_segment_per_frame() {
+        let grain = r"filmgrn1
+E 0 9223372036854775807 1 7391 1
+	p 0 6 0 8 0 1 0 0 0 0 0 0
+	sY 2 0 20 255 4
+	sCb 0
+	sCr 0
+	cY
+	cCb 0
+	cCr 0
+";
+        let segments = parse_grain_table(grain)
+            .expect("valid grain table")
+            .into_iter()
+            .map(GrainTableSegment::from)
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+
+        write_x265_aom_file(&segments, 2, None, &mut output).expect("write x265 records");
+
+        assert_eq!(output.len(), 316);
+        assert_eq!(&output[0..4], &1_i32.to_le_bytes());
+        assert_eq!(&output[4..6], &7391_u16.to_le_bytes());
+        assert_eq!(&output[6..10], &1_i32.to_le_bytes());
+        assert_eq!(&output[10..14], &2_i32.to_le_bytes());
+        assert_eq!(&output[158..162], &1_i32.to_le_bytes());
+    }
 }
