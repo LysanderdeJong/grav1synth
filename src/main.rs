@@ -11,6 +11,7 @@ use std::{
     io::{BufWriter, Write, stderr},
     num::NonZeroU8,
     path::PathBuf,
+    sync::mpsc::sync_channel,
     time::Duration,
 };
 
@@ -522,8 +523,8 @@ pub fn main() -> Result<()> {
                 ProgressBar::hidden()
             };
 
-            let mut source_reader = BitstreamReader::open(&source)?;
-            let mut denoised_reader = BitstreamReader::open(&denoised)?;
+            let source_reader = BitstreamReader::open(&source)?;
+            let denoised_reader = BitstreamReader::open(&denoised)?;
             let frame_rate = source_reader.get_video_details().frame_rate;
             let source_bd = source_reader.get_video_details().bit_depth;
             let denoised_bd = denoised_reader.get_video_details().bit_depth;
@@ -538,97 +539,43 @@ pub fn main() -> Result<()> {
             let non_zero_source_bd =
                 NonZeroU8::new(source_bd as u8).ok_or_else(|| anyhow!("bd should not be 0"))?;
 
-            let mut frames = 0usize;
-            loop {
-                debug!("Diffing next frame");
-                match (source_bd, denoised_bd) {
-                    (8, 8) => match get_filtered_frame_pair::<u8, u8>(
-                        &mut source_reader,
-                        &mut denoised_reader,
-                        non_zero_source_bd,
-                        filters.as_ref(),
-                    )? {
-                        (Some(source_frame), Some(denoised_frame)) => {
-                            differ.diff_frame(&source_frame, &denoised_frame)?;
-                        }
-                        (None, None) => {
-                            break;
-                        }
-                        _ => {
-                            warn!(
-                                "Videos did not have equal frame counts. Resulting grain table \
-                                 may not be as expected."
-                            );
-                            break;
-                        }
-                    },
-                    (8, 9..=16) => match get_filtered_frame_pair::<u8, u16>(
-                        &mut source_reader,
-                        &mut denoised_reader,
-                        non_zero_source_bd,
-                        filters.as_ref(),
-                    )? {
-                        (Some(source_frame), Some(denoised_frame)) => {
-                            differ.diff_frame(&source_frame, &denoised_frame)?;
-                        }
-                        (None, None) => {
-                            break;
-                        }
-                        _ => {
-                            warn!(
-                                "Videos did not have equal frame counts. Resulting grain table \
-                                 may not be as expected."
-                            );
-                            break;
-                        }
-                    },
-                    (9..=16, 8) => match get_filtered_frame_pair::<u16, u8>(
-                        &mut source_reader,
-                        &mut denoised_reader,
-                        non_zero_source_bd,
-                        filters.as_ref(),
-                    )? {
-                        (Some(source_frame), Some(denoised_frame)) => {
-                            differ.diff_frame(&source_frame, &denoised_frame)?;
-                        }
-                        (None, None) => {
-                            break;
-                        }
-                        _ => {
-                            warn!(
-                                "Videos did not have equal frame counts. Resulting grain table \
-                                 may not be as expected."
-                            );
-                            break;
-                        }
-                    },
-                    (9..=16, 9..=16) => match get_filtered_frame_pair::<u16, u16>(
-                        &mut source_reader,
-                        &mut denoised_reader,
-                        non_zero_source_bd,
-                        filters.as_ref(),
-                    )? {
-                        (Some(source_frame), Some(denoised_frame)) => {
-                            differ.diff_frame(&source_frame, &denoised_frame)?;
-                        }
-                        (None, None) => {
-                            break;
-                        }
-                        _ => {
-                            warn!(
-                                "Videos did not have equal frame counts. Resulting grain table \
-                                 may not be as expected."
-                            );
-                            break;
-                        }
-                    },
-                    _ => {
-                        bail!("Bit depths not between 8-16 are not currently supported");
-                    }
+            let frames = match (source_bd, denoised_bd) {
+                (8, 8) => diff_frame_pairs::<u8, u8>(
+                    source_reader,
+                    denoised_reader,
+                    non_zero_source_bd,
+                    filters,
+                    &mut differ,
+                    &progress,
+                )?,
+                (8, 9..=16) => diff_frame_pairs::<u8, u16>(
+                    source_reader,
+                    denoised_reader,
+                    non_zero_source_bd,
+                    filters,
+                    &mut differ,
+                    &progress,
+                )?,
+                (9..=16, 8) => diff_frame_pairs::<u16, u8>(
+                    source_reader,
+                    denoised_reader,
+                    non_zero_source_bd,
+                    filters,
+                    &mut differ,
+                    &progress,
+                )?,
+                (9..=16, 9..=16) => diff_frame_pairs::<u16, u16>(
+                    source_reader,
+                    denoised_reader,
+                    non_zero_source_bd,
+                    filters,
+                    &mut differ,
+                    &progress,
+                )?,
+                _ => {
+                    bail!("Bit depths not between 8-16 are not currently supported");
                 }
-                frames += 1;
-                progress.inc(1);
-            }
+            };
             progress.finish();
 
             let grain_tables = differ.finish();
@@ -795,6 +742,74 @@ pub fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[allow(clippy::type_complexity)]
+fn diff_frame_pairs<T: Pixel + Send + 'static, U: Pixel + Send + 'static>(
+    mut source_reader: BitstreamReader,
+    mut denoised_reader: BitstreamReader,
+    source_bd: NonZeroU8,
+    filters: Option<FilterChain>,
+    differ: &mut DiffGenerator,
+    progress: &ProgressBar,
+) -> Result<usize> {
+    let (sender, receiver) = sync_channel::<Result<(Option<Frame<T>>, Option<Frame<U>>)>>(1);
+    let producer = std::thread::spawn(move || {
+        loop {
+            let pair = get_filtered_frame_pair(
+                &mut source_reader,
+                &mut denoised_reader,
+                source_bd,
+                filters.as_ref(),
+            );
+            let should_stop = !matches!(pair, Ok((Some(_), Some(_))));
+
+            if sender.send(pair).is_err() || should_stop {
+                break;
+            }
+        }
+    });
+
+    let mut frames = 0usize;
+    let mut result = Ok(());
+    loop {
+        debug!("Diffing next frame");
+        match receiver.recv() {
+            Ok(Ok((Some(source_frame), Some(denoised_frame)))) => {
+                if let Err(e) = differ.diff_frame(&source_frame, &denoised_frame) {
+                    result = Err(e);
+                    break;
+                }
+                frames += 1;
+                progress.inc(1);
+            }
+            Ok(Ok((None, None))) => {
+                break;
+            }
+            Ok(Ok(_)) => {
+                warn!(
+                    "Videos did not have equal frame counts. Resulting grain table may not be as \
+                     expected."
+                );
+                break;
+            }
+            Ok(Err(e)) => {
+                result = Err(e);
+                break;
+            }
+            Err(_) => {
+                break;
+            }
+        }
+    }
+
+    drop(receiver);
+    producer
+        .join()
+        .map_err(|_| anyhow!("diff read-ahead thread panicked"))?;
+    result?;
+
+    Ok(frames)
 }
 
 #[allow(clippy::type_complexity)]
