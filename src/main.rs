@@ -3,6 +3,7 @@ mod hevc;
 mod misc;
 pub mod parser;
 pub mod presets;
+mod profile;
 pub mod reader;
 
 use std::{
@@ -528,63 +529,85 @@ pub fn main() -> Result<()> {
             let frame_rate = source_reader.get_video_details().frame_rate;
             let source_bd = source_reader.get_video_details().bit_depth;
             let denoised_bd = denoised_reader.get_video_details().bit_depth;
+            let can_preconvert_to_u8 = filters.as_ref().is_none_or(FilterChain::is_crop_only);
+            let differ_source_bd = if can_preconvert_to_u8 { 8 } else { source_bd };
+            let differ_denoised_bd = if can_preconvert_to_u8 { 8 } else { denoised_bd };
             let mut differ = DiffGenerator::new(
                 num_rational::Rational64::new(
                     i64::from(*frame_rate.numer()),
                     i64::from(*frame_rate.denom()),
                 ),
-                source_bd,
-                denoised_bd,
+                differ_source_bd,
+                differ_denoised_bd,
             );
             let non_zero_source_bd =
                 NonZeroU8::new(source_bd as u8).ok_or_else(|| anyhow!("bd should not be 0"))?;
 
-            let frames = match (source_bd, denoised_bd) {
-                (8, 8) => diff_frame_pairs::<u8, u8>(
-                    source_reader,
-                    denoised_reader,
-                    non_zero_source_bd,
-                    filters,
-                    &mut differ,
-                    &progress,
-                )?,
-                (8, 9..=16) => diff_frame_pairs::<u8, u16>(
-                    source_reader,
-                    denoised_reader,
-                    non_zero_source_bd,
-                    filters,
-                    &mut differ,
-                    &progress,
-                )?,
-                (9..=16, 8) => diff_frame_pairs::<u16, u8>(
-                    source_reader,
-                    denoised_reader,
-                    non_zero_source_bd,
-                    filters,
-                    &mut differ,
-                    &progress,
-                )?,
-                (9..=16, 9..=16) => diff_frame_pairs::<u16, u16>(
-                    source_reader,
-                    denoised_reader,
-                    non_zero_source_bd,
-                    filters,
-                    &mut differ,
-                    &progress,
-                )?,
-                _ => {
-                    bail!("Bit depths not between 8-16 are not currently supported");
-                }
-            };
+            let frames = profile::time(
+                profile::MetricId::DiffFramePairsTotal,
+                || -> Result<usize> {
+                    if can_preconvert_to_u8 {
+                        return diff_frame_pairs_preconverted_u8(
+                            source_reader,
+                            denoised_reader,
+                            filters,
+                            &mut differ,
+                            &progress,
+                        );
+                    }
+
+                    match (source_bd, denoised_bd) {
+                        (8, 8) => diff_frame_pairs::<u8, u8>(
+                            source_reader,
+                            denoised_reader,
+                            non_zero_source_bd,
+                            filters,
+                            &mut differ,
+                            &progress,
+                        ),
+                        (8, 9..=16) => diff_frame_pairs::<u8, u16>(
+                            source_reader,
+                            denoised_reader,
+                            non_zero_source_bd,
+                            filters,
+                            &mut differ,
+                            &progress,
+                        ),
+                        (9..=16, 8) => diff_frame_pairs::<u16, u8>(
+                            source_reader,
+                            denoised_reader,
+                            non_zero_source_bd,
+                            filters,
+                            &mut differ,
+                            &progress,
+                        ),
+                        (9..=16, 9..=16) => diff_frame_pairs::<u16, u16>(
+                            source_reader,
+                            denoised_reader,
+                            non_zero_source_bd,
+                            filters,
+                            &mut differ,
+                            &progress,
+                        ),
+                        _ => {
+                            bail!("Bit depths not between 8-16 are not currently supported");
+                        }
+                    }
+                },
+            )?;
             progress.finish();
 
-            let grain_tables = differ.finish();
-            let mut output_file = BufWriter::new(File::create(&output)?);
-            writeln!(&mut output_file, "filmgrn1")?;
-            for segment in grain_tables {
-                write_film_grain_segment(&segment.into(), &mut output_file)?;
-            }
-            output_file.flush()?;
+            let grain_tables = profile::time(profile::MetricId::DifferFinish, || differ.finish());
+            profile::time(profile::MetricId::OutputWrite, || -> Result<()> {
+                let mut output_file = BufWriter::new(File::create(&output)?);
+                writeln!(&mut output_file, "filmgrn1")?;
+                for segment in grain_tables {
+                    write_film_grain_segment(&segment.into(), &mut output_file)?;
+                }
+                output_file.flush()?;
+                Ok(())
+            })?;
+            profile::print_report();
             info!("Computed diff for {frames} frames");
             info!("Done, wrote output file to {}", output.to_string_lossy());
         }
@@ -753,18 +776,33 @@ fn diff_frame_pairs<T: Pixel + Send + 'static, U: Pixel + Send + 'static>(
     differ: &mut DiffGenerator,
     progress: &ProgressBar,
 ) -> Result<usize> {
-    let (sender, receiver) = sync_channel::<Result<(Option<Frame<T>>, Option<Frame<U>>)>>(1);
-    let producer = std::thread::spawn(move || {
+    let (source_sender, source_receiver) = sync_channel::<Result<Option<Frame<T>>>>(1);
+    let source_producer = std::thread::spawn(move || {
         loop {
-            let pair = get_filtered_frame_pair(
-                &mut source_reader,
-                &mut denoised_reader,
-                source_bd,
-                filters.as_ref(),
-            );
-            let should_stop = !matches!(pair, Ok((Some(_), Some(_))));
+            let mut frame = profile::time(profile::MetricId::SourceGetFrame, || {
+                source_reader.get_frame::<T>()
+            });
+            if let Some(f) = filters.as_ref() {
+                frame = profile::time(profile::MetricId::SourceFilter, || {
+                    frame.map(|opt| opt.map(|source_frame| f.apply(source_frame, source_bd)))
+                });
+            }
+            let should_stop = !matches!(frame, Ok(Some(_)));
 
-            if sender.send(pair).is_err() || should_stop {
+            if source_sender.send(frame).is_err() || should_stop {
+                break;
+            }
+        }
+    });
+    let (denoised_sender, denoised_receiver) = sync_channel::<Result<Option<Frame<U>>>>(1);
+    let denoised_producer = std::thread::spawn(move || {
+        loop {
+            let frame = profile::time(profile::MetricId::DenoisedGetFrame, || {
+                denoised_reader.get_frame::<U>()
+            });
+            let should_stop = !matches!(frame, Ok(Some(_)));
+
+            if denoised_sender.send(frame).is_err() || should_stop {
                 break;
             }
         }
@@ -774,59 +812,142 @@ fn diff_frame_pairs<T: Pixel + Send + 'static, U: Pixel + Send + 'static>(
     let mut result = Ok(());
     loop {
         debug!("Diffing next frame");
-        match receiver.recv() {
-            Ok(Ok((Some(source_frame), Some(denoised_frame)))) => {
-                if let Err(e) = differ.diff_frame(&source_frame, &denoised_frame) {
+        let source_msg = profile::time(profile::MetricId::ConsumerRecv, || source_receiver.recv());
+        let denoised_msg =
+            profile::time(profile::MetricId::ConsumerRecv, || denoised_receiver.recv());
+        match (source_msg, denoised_msg) {
+            (Ok(Ok(Some(source_frame))), Ok(Ok(Some(denoised_frame)))) => {
+                if let Err(e) = profile::time(profile::MetricId::DifferDiffFrame, || {
+                    differ.diff_frame(&source_frame, &denoised_frame)
+                }) {
                     result = Err(e);
                     break;
                 }
                 frames += 1;
                 progress.inc(1);
             }
-            Ok(Ok((None, None))) => {
+            (Ok(Ok(None)), Ok(Ok(None))) => {
                 break;
             }
-            Ok(Ok(_)) => {
+            (Ok(Ok(_)), Ok(Ok(_))) => {
                 warn!(
                     "Videos did not have equal frame counts. Resulting grain table may not be as \
                      expected."
                 );
                 break;
             }
-            Ok(Err(e)) => {
+            (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
                 result = Err(e);
                 break;
             }
-            Err(_) => {
+            (Err(_), _) | (_, Err(_)) => {
                 break;
             }
         }
     }
 
-    drop(receiver);
-    producer
+    drop(source_receiver);
+    drop(denoised_receiver);
+    source_producer
         .join()
-        .map_err(|_| anyhow!("diff read-ahead thread panicked"))?;
+        .map_err(|_| anyhow!("source read-ahead thread panicked"))?;
+    denoised_producer
+        .join()
+        .map_err(|_| anyhow!("denoised read-ahead thread panicked"))?;
     result?;
 
     Ok(frames)
 }
 
-#[allow(clippy::type_complexity)]
-fn get_filtered_frame_pair<T: Pixel, U: Pixel>(
-    source_reader: &mut BitstreamReader,
-    denoised_reader: &mut BitstreamReader,
-    source_bd: NonZeroU8,
-    filters: Option<&FilterChain>,
-) -> Result<(Option<Frame<T>>, Option<Frame<U>>)> {
-    let mut frame = source_reader.get_frame::<T>();
-    if let Some(f) = filters.as_ref() {
-        frame = frame.map(|opt| opt.map(|source_frame| f.apply(source_frame, source_bd)));
-    }
-    let source_frame = frame;
-    let denoised_frame = denoised_reader.get_frame::<U>();
+fn diff_frame_pairs_preconverted_u8(
+    mut source_reader: BitstreamReader,
+    mut denoised_reader: BitstreamReader,
+    filters: Option<FilterChain>,
+    differ: &mut DiffGenerator,
+    progress: &ProgressBar,
+) -> Result<usize> {
+    let (source_sender, source_receiver) = sync_channel::<Result<Option<Frame<u8>>>>(1);
+    let source_producer = std::thread::spawn(move || {
+        let filter_bd = NonZeroU8::new(8).expect("non-zero constant");
+        loop {
+            let mut frame = profile::time(profile::MetricId::SourceGetFrame, || {
+                source_reader.get_frame_u8()
+            });
+            if let Some(f) = filters.as_ref() {
+                frame = profile::time(profile::MetricId::SourceFilter, || {
+                    frame.map(|opt| opt.map(|source_frame| f.apply(source_frame, filter_bd)))
+                });
+            }
+            let should_stop = !matches!(frame, Ok(Some(_)));
 
-    Ok((source_frame?, denoised_frame?))
+            if source_sender.send(frame).is_err() || should_stop {
+                break;
+            }
+        }
+    });
+    let (denoised_sender, denoised_receiver) = sync_channel::<Result<Option<Frame<u8>>>>(1);
+    let denoised_producer = std::thread::spawn(move || {
+        loop {
+            let frame = profile::time(profile::MetricId::DenoisedGetFrame, || {
+                denoised_reader.get_frame_u8()
+            });
+            let should_stop = !matches!(frame, Ok(Some(_)));
+
+            if denoised_sender.send(frame).is_err() || should_stop {
+                break;
+            }
+        }
+    });
+
+    let mut frames = 0usize;
+    let mut result = Ok(());
+    loop {
+        debug!("Diffing next frame");
+        let source_msg = profile::time(profile::MetricId::ConsumerRecv, || source_receiver.recv());
+        let denoised_msg =
+            profile::time(profile::MetricId::ConsumerRecv, || denoised_receiver.recv());
+        match (source_msg, denoised_msg) {
+            (Ok(Ok(Some(source_frame))), Ok(Ok(Some(denoised_frame)))) => {
+                if let Err(e) = profile::time(profile::MetricId::DifferDiffFrame, || {
+                    differ.diff_frame(&source_frame, &denoised_frame)
+                }) {
+                    result = Err(e);
+                    break;
+                }
+                frames += 1;
+                progress.inc(1);
+            }
+            (Ok(Ok(None)), Ok(Ok(None))) => {
+                break;
+            }
+            (Ok(Ok(_)), Ok(Ok(_))) => {
+                warn!(
+                    "Videos did not have equal frame counts. Resulting grain table may not be as \
+                     expected."
+                );
+                break;
+            }
+            (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
+                result = Err(e);
+                break;
+            }
+            (Err(_), _) | (_, Err(_)) => {
+                break;
+            }
+        }
+    }
+
+    drop(source_receiver);
+    drop(denoised_receiver);
+    source_producer
+        .join()
+        .map_err(|_| anyhow!("source read-ahead thread panicked"))?;
+    denoised_producer
+        .join()
+        .map_err(|_| anyhow!("denoised read-ahead thread panicked"))?;
+    result?;
+
+    Ok(frames)
 }
 
 fn write_film_grain_segment(

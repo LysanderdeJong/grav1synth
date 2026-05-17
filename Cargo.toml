@@ -42,6 +42,7 @@ tempfile = "3.3.0"
 default = []
 ffmpeg_static = ["ffmpeg/static", "ffmpeg/build"]
 unstable = ["av1-grain/unstable"]
+profile-diff = []
 dav1d_tests = []
 
 [profile.dev]

@@ -114,6 +114,13 @@ impl FilterChain {
             .iter()
             .fold(frame, |prev, f| f.apply(&prev, source_bd))
     }
+
+    #[must_use]
+    pub fn is_crop_only(&self) -> bool {
+        self.filters
+            .iter()
+            .all(|filter| matches!(filter, Filter::Crop { .. }))
+    }
 }
 
 enum Filter {
