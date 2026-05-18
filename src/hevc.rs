@@ -5,19 +5,17 @@ use arrayvec::ArrayVec;
 use av1_grain::{
     NUM_UV_COEFFS, NUM_UV_POINTS, NUM_Y_COEFFS, NUM_Y_POINTS, v_frame::chroma::ChromaSubsampling,
 };
-use ffmpeg::{
-    Dictionary, Packet, Rational, Stream, codec, encoder, format::context::Output, media,
-};
+use ffmpeg::{Dictionary, Packet, Rational, codec, encoder, format::context::Output, media};
 use log::debug;
 use num_rational::Rational32;
+use rayon::prelude::*;
 
-use crate::{
-    GrainTableSegment, TIMESTAMP_BASE_UNIT, parser::grain::FilmGrainParams, reader::BitstreamReader,
-};
+use crate::{GrainTableSegment, parser::grain::FilmGrainParams, reader::BitstreamReader};
 
 const NAL_PREFIX_SEI: u8 = 39;
 const NAL_SUFFIX_SEI: u8 = 40;
 const SEI_USER_DATA_REGISTERED_ITU_T_T35: u64 = 4;
+const HEVC_PACKET_BATCH: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PacketFormat {
@@ -30,19 +28,34 @@ pub fn inspect_hevc_grain_table(input: &std::path::Path) -> Result<Vec<GrainTabl
     ensure_hevc(&reader)?;
     let stream_idx = reader.get_video_stream()?.index();
     let frame_rate = reader.get_video_details().frame_rate;
+    let video_stream_time_base = reader.input().stream(stream_idx as _).unwrap().time_base();
     let mut params_by_frame = Vec::new();
-
+    let mut packet_data = Vec::with_capacity(HEVC_PACKET_BATCH);
+    let mut packet_pts = Vec::with_capacity(HEVC_PACKET_BATCH);
     for (stream, packet) in reader.input().packets().filter_map(Result::ok) {
         if stream.index() != stream_idx {
             continue;
         }
-        let params = packet
-            .data()
-            .map(parse_packet_afgs1_params)
-            .transpose()?
-            .flatten();
-        params_by_frame.push(params);
+        if let Some(data) = packet.data() {
+            if packet_has_vcl(data)? {
+                packet_data.push(data.to_vec());
+                packet_pts.push(packet.pts().map(|pts| ffmpeg_pts_to_grain_ts(pts, video_stream_time_base)));
+            }
+        }
+        if packet_data.len() >= HEVC_PACKET_BATCH {
+            params_by_frame.extend(packet_pts.drain(..).zip(parse_hevc_grain_batch(&packet_data)?));
+            packet_data.clear();
+        }
     }
+    params_by_frame.extend(packet_pts.drain(..).zip(parse_hevc_grain_batch(&packet_data)?));
+
+    if params_by_frame.iter().any(|(pts, _)| pts.is_some()) {
+        params_by_frame.sort_by_key(|(pts, _)| pts.unwrap_or(0));
+    }
+    let params_by_frame = params_by_frame
+        .into_iter()
+        .map(|(_, params)| params)
+        .collect::<Vec<_>>();
 
     Ok(aggregate_hevc_grain(&params_by_frame, frame_rate))
 }
@@ -52,18 +65,23 @@ pub fn has_hevc_grain(input: &std::path::Path) -> Result<bool> {
     ensure_hevc(&reader)?;
     let stream_idx = reader.get_video_stream()?.index();
 
+    let mut packet_data = Vec::with_capacity(HEVC_PACKET_BATCH);
     for (stream, packet) in reader.input().packets().filter_map(Result::ok) {
         if stream.index() != stream_idx {
             continue;
         }
-        if let Some(data) = packet.data()
-            && find_nals(data)?.iter().any(|nal| is_afgs1_sei(nal.data))
-        {
-            return Ok(true);
+        if let Some(data) = packet.data() {
+            packet_data.push(data.to_vec());
+        }
+        if packet_data.len() >= HEVC_PACKET_BATCH {
+            if hevc_grain_batch_has_grain(&packet_data)? {
+                return Ok(true);
+            }
+            packet_data.clear();
         }
     }
 
-    Ok(false)
+    hevc_grain_batch_has_grain(&packet_data)
 }
 
 pub fn modify_hevc_grain(
@@ -84,6 +102,11 @@ pub fn modify_hevc_grain(
     let mut stream_mapping = vec![0; ictx.nb_streams() as _];
     let mut ist_time_bases = vec![Rational(0, 1); ictx.nb_streams() as _];
     let mut ost_index = 0;
+    let presentation_timestamps = if segments.is_some() {
+        presentation_timestamps_by_decode_index(input)?
+    } else {
+        Vec::new()
+    };
 
     let input_chapters: Vec<(i64, Rational, i64, i64, Dictionary)> = ictx
         .chapters()
@@ -141,17 +164,136 @@ pub fn modify_hevc_grain(
     let video_stream_time_base = ictx.stream(stream_idx as _).unwrap().time_base();
     writer.write_header()?;
 
-    for (stream, mut packet) in ictx.packets().filter_map(Result::ok) {
-        if stream.index() == stream_idx
-            && let Some(data) = packet.data()
-        {
+    let mut packet_entries = Vec::with_capacity(HEVC_PACKET_BATCH);
+    let mut video_jobs = Vec::with_capacity(HEVC_PACKET_BATCH);
+    let mut video_packet_index = 0usize;
+    for (stream, packet) in ictx.packets().filter_map(Result::ok) {
+        let video_job_index = if stream.index() == stream_idx {
+            packet.data().map(|data| {
+                let params = if packet_has_vcl(data).unwrap_or(false) {
+                    let packet_ts = presentation_timestamps
+                        .get(video_packet_index)
+                        .copied()
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            ffmpeg_pts_to_grain_ts(
+                                packet.pts().unwrap_or_default(),
+                                video_stream_time_base,
+                            )
+                        });
+                    video_packet_index += 1;
+                    segments
+                        .and_then(|segments| segment_for_ts(segments, packet_ts))
+                        .cloned()
+                } else {
+                    None
+                };
+                let index = video_jobs.len();
+                video_jobs.push(VideoPacketJob {
+                    data: data.to_vec(),
+                    params,
+                    modified: Vec::new(),
+                });
+                index
+            })
+        } else {
+            None
+        };
+        packet_entries.push(PacketEntry {
+            stream_index: stream.index(),
+            packet,
+            video_job_index,
+        });
+        if packet_entries.len() >= HEVC_PACKET_BATCH {
+            process_and_write_packet_batch(
+                &mut packet_entries,
+                &mut video_jobs,
+                &mut writer,
+                &stream_mapping,
+                &ist_time_bases,
+                replace,
+                width,
+                height,
+                chroma_sampling,
+            )?;
+        }
+    }
+    process_and_write_packet_batch(
+        &mut packet_entries,
+        &mut video_jobs,
+        &mut writer,
+        &stream_mapping,
+        &ist_time_bases,
+        replace,
+        width,
+        height,
+        chroma_sampling,
+    )?;
+
+    writer.write_trailer()?;
+    Ok(())
+}
+
+struct PacketEntry {
+    stream_index: usize,
+    packet: Packet,
+    video_job_index: Option<usize>,
+}
+
+struct VideoPacketJob {
+    data: Vec<u8>,
+    params: Option<FilmGrainParams>,
+    modified: Vec<u8>,
+}
+
+fn parse_hevc_grain_batch(packet_data: &[Vec<u8>]) -> Result<Vec<Option<FilmGrainParams>>> {
+    packet_data
+        .par_iter()
+        .map(|data| parse_packet_afgs1_params(data))
+        .collect()
+}
+
+fn hevc_grain_batch_has_grain(packet_data: &[Vec<u8>]) -> Result<bool> {
+    Ok(packet_data
+        .par_iter()
+        .map(|data| Ok(find_nals(data)?.iter().any(|nal| is_afgs1_sei(nal.data))))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .any(|found| found))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_and_write_packet_batch(
+    packet_entries: &mut Vec<PacketEntry>,
+    video_jobs: &mut Vec<VideoPacketJob>,
+    writer: &mut Output,
+    stream_mapping: &[isize],
+    ist_time_bases: &[Rational],
+    replace: bool,
+    width: usize,
+    height: usize,
+    chroma_sampling: ChromaSubsampling,
+) -> Result<()> {
+    video_jobs.par_iter_mut().try_for_each(|job| {
+        job.modified = modify_packet(
+            &job.data,
+            job.params.as_ref(),
+            replace,
+            width,
+            height,
+            chroma_sampling,
+        )?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    for entry in packet_entries.drain(..) {
+        let stream_index = entry.stream_index;
+        let mut packet = entry.packet;
+        if let Some(video_job_index) = entry.video_job_index {
+            let modified = &video_jobs[video_job_index].modified;
             let pts = packet.pts();
             let dts = packet.dts();
             let duration = packet.duration();
-            let packet_ts =
-                ffmpeg_pts_to_grain_ts(packet.pts().unwrap_or_default(), video_stream_time_base);
-            let params = segments.and_then(|segments| segment_for_ts(segments, packet_ts));
-            let modified = modify_packet(data, params, replace, width, height, chroma_sampling)?;
             match modified.len().cmp(&packet.size()) {
                 Ordering::Greater => packet.grow(modified.len() - packet.size()),
                 Ordering::Less => packet.shrink(modified.len()),
@@ -160,19 +302,13 @@ pub fn modify_hevc_grain(
             packet.set_pts(pts);
             packet.set_dts(dts);
             packet.set_duration(duration);
-            packet.data_mut().unwrap().copy_from_slice(&modified);
+            packet.data_mut().unwrap().copy_from_slice(modified);
         }
 
-        write_packet(
-            &mut writer,
-            packet,
-            &stream,
-            &stream_mapping,
-            &ist_time_bases,
-        )?;
+        write_packet(writer, packet, stream_index, stream_mapping, ist_time_bases)?;
     }
+    video_jobs.clear();
 
-    writer.write_trailer()?;
     Ok(())
 }
 
@@ -197,6 +333,49 @@ fn ffmpeg_pts_to_grain_ts(pts: i64, time_base: Rational) -> u64 {
     (pts * num * 10_000_000u64).div_ceil(den)
 }
 
+fn frame_index_to_grain_ts(frame_index: usize, frame_rate: Rational32) -> u64 {
+    let numer = i64::from(*frame_rate.numer());
+    let denom = i64::from(*frame_rate.denom());
+    if numer <= 0 || denom <= 0 {
+        return 0;
+    }
+    (((frame_index as u128) * (denom as u128) * 10_000_000u128) / (numer as u128)) as u64
+}
+
+fn presentation_timestamps_by_decode_index(input: &std::path::Path) -> Result<Vec<Option<u64>>> {
+    let mut reader = BitstreamReader::open(input)?;
+    ensure_hevc(&reader)?;
+    let stream_idx = reader.get_video_stream()?.index();
+    let frame_rate = reader.get_video_details().frame_rate;
+
+    let mut packets = Vec::new();
+    for (stream, packet) in reader.input().packets().filter_map(Result::ok) {
+        if stream.index() == stream_idx
+            && let Some(data) = packet.data()
+        {
+            if packet_has_vcl(data)? {
+                packets.push((packets.len(), packet.pts()));
+            }
+        }
+    }
+    if packets.iter().any(|(_, pts)| pts.is_none()) {
+        return Ok(vec![None; packets.len()]);
+    }
+
+    packets.sort_by(|(left_index, left_pts), (right_index, right_pts)| {
+        left_pts
+            .cmp(right_pts)
+            .then_with(|| left_index.cmp(right_index))
+    });
+
+    let mut timestamps = vec![None; packets.len()];
+    for (frame_index, (decode_index, _)) in packets.into_iter().enumerate() {
+        timestamps[decode_index] = Some(frame_index_to_grain_ts(frame_index, frame_rate));
+    }
+
+    Ok(timestamps)
+}
+
 fn segment_for_ts(segments: &[GrainTableSegment], timestamp: u64) -> Option<&FilmGrainParams> {
     segments
         .iter()
@@ -207,11 +386,10 @@ fn segment_for_ts(segments: &[GrainTableSegment], timestamp: u64) -> Option<&Fil
 fn write_packet(
     writer: &mut Output,
     mut packet: Packet,
-    stream: &Stream,
+    ist_index: usize,
     stream_mapping: &[isize],
     ist_time_bases: &[Rational],
 ) -> Result<()> {
-    let ist_index = stream.index();
     let ost_index = stream_mapping[ist_index];
     if ost_index < 0 {
         return Ok(());
@@ -250,7 +428,8 @@ fn modify_packet(
         .transpose()?;
 
     for nal in nals {
-        if !inserted && sei.is_some() && is_vcl_nal(nal_type(nal.data)?) {
+        let nal_type = nal_type(nal.data).ok();
+        if !inserted && sei.is_some() && nal_type.is_some_and(is_vcl_nal) {
             out.extend_from_slice(sei.as_ref().unwrap());
             inserted = true;
         }
@@ -273,6 +452,9 @@ struct Nal<'a> {
 }
 
 fn find_nals(data: &[u8]) -> Result<Vec<Nal<'_>>> {
+    if let Ok(nals) = find_length_prefixed_nals(data, 4) {
+        return Ok(nals);
+    }
     if starts_with_annex_b(data) {
         Ok(find_annex_b_nals(data))
     } else {
@@ -345,6 +527,12 @@ fn nal_type(nal: &[u8]) -> Result<u8> {
 
 fn is_vcl_nal(nal_type: u8) -> bool {
     nal_type <= 31
+}
+
+fn packet_has_vcl(data: &[u8]) -> Result<bool> {
+    Ok(find_nals(data)?
+        .iter()
+        .any(|nal| nal_type(nal.data).is_ok_and(is_vcl_nal)))
 }
 
 fn is_afgs1_sei(nal: &[u8]) -> bool {
@@ -590,14 +778,11 @@ fn aggregate_hevc_grain(
     params_by_frame: &[Option<FilmGrainParams>],
     frame_rate: Rational32,
 ) -> Vec<GrainTableSegment> {
-    let time_per_packet =
-        *frame_rate.denom() as f64 / *frame_rate.numer() as f64 * TIMESTAMP_BASE_UNIT;
-    let mut cur_packet_start = 0u64;
-    let mut cur_packet_end_f = time_per_packet;
-    let mut cur_packet_end = cur_packet_end_f.ceil() as u64;
     let mut segments: Vec<GrainTableSegment> = Vec::new();
 
-    for params in params_by_frame {
+    for (frame_index, params) in params_by_frame.iter().enumerate() {
+        let cur_packet_start = frame_index_to_grain_ts(frame_index, frame_rate);
+        let cur_packet_end = frame_index_to_grain_ts(frame_index + 1, frame_rate);
         if let Some(params) = params {
             if let Some(cur_segment) = segments.last_mut()
                 && cur_segment.end_time == cur_packet_start
@@ -612,9 +797,10 @@ fn aggregate_hevc_grain(
                 });
             }
         }
-        cur_packet_start = cur_packet_end;
-        cur_packet_end_f += time_per_packet;
-        cur_packet_end = cur_packet_end_f.ceil() as u64;
+    }
+
+    if let Some(last) = segments.last_mut() {
+        last.end_time = i64::MAX as u64;
     }
 
     segments
@@ -720,6 +906,31 @@ fn build_afgs1_payload(
     }
 
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_nals_prefers_valid_length_prefix_over_annex_b_lookalike() {
+        let mut packet = vec![0x00, 0x00, 0x01, 0xe6, 0x02, 0x01];
+        packet.resize(490, 0);
+
+        let nals = find_nals(&packet).expect("length-prefixed packet should parse");
+
+        assert_eq!(nals.len(), 1);
+        assert_eq!(nals[0].format, PacketFormat::LengthPrefixed { length_size: 4 });
+        assert_eq!(nal_type(nals[0].data).unwrap(), 1);
+    }
+
+    #[test]
+    fn frame_index_timestamps_match_x265_aom_floor_mapping() {
+        let frame_rate = Rational32::new(24_000, 1_001);
+
+        assert_eq!(frame_index_to_grain_ts(27, frame_rate), 11_261_250);
+        assert_eq!(frame_index_to_grain_ts(28, frame_rate), 11_678_333);
+    }
 }
 
 fn write_afgs1_params(
