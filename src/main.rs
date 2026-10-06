@@ -36,6 +36,7 @@ use log::{debug, error, info, warn};
 use num_rational::Rational32;
 use parser::grain::{FilmGrainHeader, FilmGrainParams};
 use rayon::ThreadPoolBuilder;
+use v_frame_05::pixel::Pixel as Pixel05;
 
 use crate::{
     filters::FilterChain, misc::get_frame_count, parser::BitstreamParser, reader::BitstreamReader,
@@ -768,7 +769,7 @@ pub fn main() -> Result<()> {
 }
 
 #[allow(clippy::type_complexity)]
-fn diff_frame_pairs<T: Pixel + Send + 'static, U: Pixel + Send + 'static>(
+fn diff_frame_pairs<T: Pixel + Pixel05 + Send + 'static, U: Pixel + Pixel05 + Send + 'static>(
     mut source_reader: BitstreamReader,
     mut denoised_reader: BitstreamReader,
     source_bd: NonZeroU8,

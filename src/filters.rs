@@ -1,12 +1,20 @@
 use std::num::{NonZeroU8, NonZeroUsize};
 
 use anyhow::{Result, anyhow, bail};
-use av1_grain::v_frame::frame::Frame;
-use av1_grain::v_frame::pixel::Pixel;
+use av1_grain::v_frame::{
+    chroma::ChromaSubsampling as Subsampling07,
+    frame::{Frame, FrameBuilder as FrameBuilder07},
+    pixel::Pixel,
+    plane::Plane as Plane07,
+};
+use v_frame_05::{
+    chroma::ChromaSubsampling as Subsampling05, frame::Frame as Frame05,
+    frame::FrameBuilder as FrameBuilder05, pixel::Pixel as Pixel05, plane::Plane as Plane05,
+};
 use video_resize::algorithms::{
     BicubicCatmullRom, BicubicHermite, BicubicMitchell, Lanczos3, Spline36,
 };
-use video_resize::{CropDimensions, ResizeDimensions, crop, resize};
+use video_resize::{CropDimensions, ResizeAlgorithm, ResizeDimensions, crop, resize};
 
 pub struct FilterChain {
     filters: Vec<Filter>,
@@ -109,7 +117,7 @@ impl FilterChain {
         Ok(Self { filters: parsed })
     }
 
-    pub fn apply<T: Pixel>(&self, frame: Frame<T>, source_bd: NonZeroU8) -> Frame<T> {
+    pub fn apply<T: Pixel + Pixel05>(&self, frame: Frame<T>, source_bd: NonZeroU8) -> Frame<T> {
         self.filters
             .iter()
             .fold(frame, |prev, f| f.apply(&prev, source_bd))
@@ -138,14 +146,14 @@ enum Filter {
 }
 
 impl Filter {
-    pub fn apply<T: Pixel>(&self, frame: &Frame<T>, source_bd: NonZeroU8) -> Frame<T> {
+    pub fn apply<T: Pixel + Pixel05>(&self, frame: &Frame<T>, source_bd: NonZeroU8) -> Frame<T> {
         match *self {
             Filter::Crop {
                 top,
                 bottom,
                 left,
                 right,
-            } => crop(
+            } => crop_frame(
                 frame,
                 CropDimensions {
                     top,
@@ -153,39 +161,167 @@ impl Filter {
                     left,
                     right,
                 },
-            )
-            .unwrap(),
+                source_bd,
+            ),
             Filter::Resize { width, height, alg } => match alg {
-                "hermite" => resize::<T, BicubicHermite>(
+                "hermite" => resize_frame::<T, BicubicHermite>(
                     frame,
                     ResizeDimensions { width, height },
                     source_bd,
-                )
-                .unwrap(),
-                "catmullrom" => resize::<T, BicubicCatmullRom>(
+                ),
+                "catmullrom" => resize_frame::<T, BicubicCatmullRom>(
                     frame,
                     ResizeDimensions { width, height },
                     source_bd,
-                )
-                .unwrap(),
-                "mitchell" => resize::<T, BicubicMitchell>(
+                ),
+                "mitchell" => resize_frame::<T, BicubicMitchell>(
                     frame,
                     ResizeDimensions { width, height },
                     source_bd,
-                )
-                .unwrap(),
-                "lanczos" => {
-                    resize::<T, Lanczos3>(frame, ResizeDimensions { width, height }, source_bd)
-                        .unwrap()
-                }
-                "spline36" => {
-                    resize::<T, Spline36>(frame, ResizeDimensions { width, height }, source_bd)
-                        .unwrap()
-                }
+                ),
+                "lanczos" => resize_frame::<T, Lanczos3>(
+                    frame,
+                    ResizeDimensions { width, height },
+                    source_bd,
+                ),
+                "spline36" => resize_frame::<T, Spline36>(
+                    frame,
+                    ResizeDimensions { width, height },
+                    source_bd,
+                ),
                 _ => unreachable!(),
             },
         }
     }
+}
+
+/// Runs `video_resize` (which speaks v_frame 0.5) on a v_frame 0.7 frame by
+/// converting across the crate boundary in both directions. Pixel values are
+/// preserved exactly; only the container types change.
+fn crop_frame<T>(frame: &Frame<T>, dimensions: CropDimensions, source_bd: NonZeroU8) -> Frame<T>
+where
+    T: Pixel + Pixel05,
+{
+    let converted = frame_to_05(frame, source_bd.get()).unwrap();
+    let cropped = crop(&converted, dimensions).unwrap();
+    frame_from_05(&cropped, source_bd.get()).unwrap()
+}
+
+/// See [`crop_frame`]: resize runs on converted frames so output pixels match
+/// `video-resize` output exactly.
+fn resize_frame<T, F>(
+    frame: &Frame<T>,
+    dimensions: ResizeDimensions,
+    source_bd: NonZeroU8,
+) -> Frame<T>
+where
+    T: Pixel + Pixel05,
+    F: ResizeAlgorithm,
+{
+    let converted = frame_to_05(frame, source_bd.get()).unwrap();
+    let resized = resize::<T, F>(&converted, dimensions, source_bd).unwrap();
+    frame_from_05(&resized, source_bd.get()).unwrap()
+}
+
+fn subsampling_to_05(subsampling: Subsampling07) -> Subsampling05 {
+    match subsampling {
+        Subsampling07::Yuv420 => Subsampling05::Yuv420,
+        Subsampling07::Yuv422 => Subsampling05::Yuv422,
+        Subsampling07::Yuv444 => Subsampling05::Yuv444,
+        Subsampling07::Monochrome => Subsampling05::Monochrome,
+    }
+}
+
+fn subsampling_from_05(subsampling: Subsampling05) -> Subsampling07 {
+    match subsampling {
+        Subsampling05::Yuv420 => Subsampling07::Yuv420,
+        Subsampling05::Yuv422 => Subsampling07::Yuv422,
+        Subsampling05::Yuv444 => Subsampling07::Yuv444,
+        Subsampling05::Monochrome => Subsampling07::Monochrome,
+    }
+}
+
+fn copy_plane_to_05<T>(source: &Plane07<T>, dest: &mut Plane05<T>) -> Result<()>
+where
+    T: Pixel + Pixel05,
+{
+    let converted: Vec<T> = source
+        .rows()
+        .flat_map(|row| row.iter())
+        .map(|pixel| {
+            let value: u16 = (*pixel).into();
+            num_traits::NumCast::from(value).expect("identical bit depths convert losslessly")
+        })
+        .collect();
+    dest.copy_from_slice(&converted)
+        .map_err(|error| anyhow!("plane conversion failed: {error}"))?;
+    Ok(())
+}
+
+fn copy_plane_from_05<T>(source: &Plane05<T>, dest: &mut Plane07<T>) -> Result<()>
+where
+    T: Pixel + Pixel05,
+{
+    let converted: Vec<T> = source
+        .rows()
+        .flat_map(|row| row.iter())
+        .map(|pixel| {
+            let value: u16 = num_traits::ToPrimitive::to_u16(pixel)
+                .expect("identical bit depths convert losslessly");
+            num_traits::NumCast::from(value).expect("identical bit depths convert losslessly")
+        })
+        .collect();
+    dest.copy_from_slice(&converted)
+        .map_err(|error| anyhow!("plane conversion failed: {error}"))?;
+    Ok(())
+}
+
+fn frame_to_05<T>(frame: &Frame<T>, bit_depth: u8) -> Result<Frame05<T>>
+where
+    T: Pixel + Pixel05,
+{
+    let width = frame.y_plane.width();
+    let height = frame.y_plane.height();
+    let mut converted: Frame05<T> = FrameBuilder05::new(
+        NonZeroUsize::new(width).ok_or_else(|| anyhow!("cannot convert empty frame"))?,
+        NonZeroUsize::new(height).ok_or_else(|| anyhow!("cannot convert empty frame"))?,
+        subsampling_to_05(frame.subsampling),
+        NonZeroU8::new(bit_depth).ok_or_else(|| anyhow!("cannot convert zero-bit-depth frame"))?,
+    )
+    .build()
+    .map_err(|error| anyhow!("frame conversion failed: {error}"))?;
+    copy_plane_to_05(&frame.y_plane, &mut converted.y_plane)?;
+    if let (Some(source), Some(dest)) = (frame.u_plane.as_ref(), converted.u_plane.as_mut()) {
+        copy_plane_to_05(source, dest)?;
+    }
+    if let (Some(source), Some(dest)) = (frame.v_plane.as_ref(), converted.v_plane.as_mut()) {
+        copy_plane_to_05(source, dest)?;
+    }
+    Ok(converted)
+}
+
+fn frame_from_05<T>(frame: &Frame05<T>, bit_depth: u8) -> Result<Frame<T>>
+where
+    T: Pixel + Pixel05,
+{
+    let width = frame.y_plane.width().get();
+    let height = frame.y_plane.height().get();
+    let mut converted: Frame<T> = FrameBuilder07::new(
+        width,
+        height,
+        subsampling_from_05(frame.subsampling),
+        bit_depth,
+    )
+    .build()
+    .map_err(|error| anyhow!("frame conversion failed: {error}"))?;
+    copy_plane_from_05(&frame.y_plane, &mut converted.y_plane)?;
+    if let (Some(source), Some(dest)) = (frame.u_plane.as_ref(), converted.u_plane.as_mut()) {
+        copy_plane_from_05(source, dest)?;
+    }
+    if let (Some(source), Some(dest)) = (frame.v_plane.as_ref(), converted.v_plane.as_mut()) {
+        copy_plane_from_05(source, dest)?;
+    }
+    Ok(converted)
 }
 
 #[cfg(test)]
@@ -367,5 +503,148 @@ mod tests {
             "resize:width=640,height=tall",
             "invalid digit found in string",
         );
+    }
+
+    fn pattern(x: usize, y: usize, plane: usize) -> u16 {
+        ((x * 3 + y * 5 + (x * y) % 17 + plane * 101) % 1024) as u16
+    }
+
+    fn build_frame_07<T>(width: usize, height: usize, bit_depth: u8) -> Frame<T>
+    where
+        T: Pixel + Pixel05,
+    {
+        use FrameBuilder07 as Builder;
+        let mut frame: Frame<T> = Builder::new(width, height, Subsampling07::Yuv420, bit_depth)
+            .build()
+            .expect("valid frame");
+        let max: u16 = if bit_depth == 8 { 255 } else { 1023 };
+        for plane_index in 0..3 {
+            let (w, h) = {
+                let plane = frame.plane(plane_index).expect("plane exists");
+                (plane.width(), plane.height())
+            };
+            let plane = frame.plane_mut(plane_index).expect("plane exists");
+            for (y, row) in plane.rows_mut().enumerate().take(h) {
+                for (x, pixel) in row.iter_mut().enumerate().take(w) {
+                    let value = pattern(x, y, plane_index) % (max + 1);
+                    *pixel = num_traits::NumCast::from(value).expect("in range");
+                }
+            }
+        }
+        frame
+    }
+
+    fn build_frame_05<T>(width: usize, height: usize, bit_depth: u8) -> Frame05<T>
+    where
+        T: Pixel05,
+    {
+        let mut frame: Frame05<T> = FrameBuilder05::new(
+            NonZeroUsize::new(width).expect("nonzero"),
+            NonZeroUsize::new(height).expect("nonzero"),
+            Subsampling05::Yuv420,
+            NonZeroU8::new(bit_depth).expect("nonzero"),
+        )
+        .build()
+        .expect("valid frame");
+        let max: u16 = if bit_depth == 8 { 255 } else { 1023 };
+        for plane_index in 0..3 {
+            let (w, h) = {
+                let plane = frame.plane(plane_index).expect("plane exists");
+                (plane.width().get(), plane.height().get())
+            };
+            let plane = frame.plane_mut(plane_index).expect("plane exists");
+            for (y, row) in plane.rows_mut().enumerate().take(h) {
+                for (x, pixel) in row.iter_mut().enumerate().take(w) {
+                    let value = pattern(x, y, plane_index) % (max + 1);
+                    *pixel = num_traits::NumCast::from(value).expect("in range");
+                }
+            }
+        }
+        frame
+    }
+
+    fn flat_pixels_07<T>(frame: &Frame<T>) -> Vec<u16>
+    where
+        T: Pixel,
+    {
+        let mut out = Vec::new();
+        for plane_index in 0..3 {
+            let plane = frame.plane(plane_index).expect("plane exists");
+            let (w, h) = (plane.width(), plane.height());
+            for row in plane.rows().take(h) {
+                for pixel in row.iter().take(w) {
+                    let value: u16 = (*pixel).into();
+                    out.push(value);
+                }
+            }
+        }
+        out
+    }
+
+    fn flat_pixels_05<T>(frame: &Frame05<T>) -> Vec<u16>
+    where
+        T: Pixel05,
+    {
+        let mut out = Vec::new();
+        for plane_index in 0..3 {
+            let plane = frame.plane(plane_index).expect("plane exists");
+            let (w, h) = (plane.width().get(), plane.height().get());
+            for row in plane.rows().take(h) {
+                for pixel in row.iter().take(w) {
+                    out.push(num_traits::NumCast::from(*pixel).expect("u16 holds all"));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn shim_crop_zero_round_trip_is_lossless() {
+        for (width, height, bit_depth) in [(64usize, 64usize, 8u8), (62, 30, 10)] {
+            let source_bd = NonZeroU8::new(bit_depth).expect("nonzero");
+            let chain = FilterChain::new("crop:top=0,bottom=0,left=0,right=0").unwrap();
+            if bit_depth == 8 {
+                let frame = build_frame_07::<u8>(width, height, bit_depth);
+                let expected = flat_pixels_07(&frame);
+                let actual = flat_pixels_07(&chain.apply(frame, source_bd));
+                assert_eq!(actual, expected, "u8 round-trip {width}x{height}");
+            } else {
+                let frame = build_frame_07::<u16>(width, height, bit_depth);
+                let expected = flat_pixels_07(&frame);
+                let actual = flat_pixels_07(&chain.apply(frame, source_bd));
+                assert_eq!(actual, expected, "u16 round-trip {width}x{height}");
+            }
+        }
+    }
+
+    #[test]
+    fn shim_resize_matches_direct_video_resize() {
+        use video_resize::algorithms::Lanczos3;
+
+        for (bit_depth, is_u8) in [(8u8, true), (10, false)] {
+            let source_bd = NonZeroU8::new(bit_depth).expect("nonzero");
+            let chain = FilterChain::new("resize:width=32,height=32,alg=lanczos").unwrap();
+            let target = ResizeDimensions {
+                width: NonZeroUsize::new(32).expect("nonzero"),
+                height: NonZeroUsize::new(32).expect("nonzero"),
+            };
+            if is_u8 {
+                let frame = build_frame_07::<u8>(64, 64, bit_depth);
+                let shimmed = flat_pixels_07(&chain.apply(frame, source_bd));
+                let oracle_source = build_frame_05::<u8>(64, 64, bit_depth);
+                let oracle =
+                    video_resize::resize::<u8, Lanczos3>(&oracle_source, target, source_bd)
+                        .expect("oracle resizes");
+                assert_eq!(shimmed, flat_pixels_05(&oracle), "u8 resize parity");
+            } else {
+                let frame = build_frame_07::<u16>(64, 64, bit_depth);
+                let shimmed = flat_pixels_07(&chain.apply(frame, source_bd));
+                let oracle_source = build_frame_05::<u16>(64, 64, bit_depth);
+                let oracle =
+                    video_resize::resize::<u16, Lanczos3>(&oracle_source, target, source_bd)
+                        .expect("oracle resizes");
+                assert_eq!(shimmed, flat_pixels_05(&oracle), "u16 resize parity");
+            }
+        }
     }
 }

@@ -230,27 +230,28 @@ impl BitstreamReader {
 fn decode_frame<T: Pixel>(details: &VideoDetails, decoded: &frame::Video) -> Result<Frame<T>> {
     let width = details.width;
     let height = details.height;
+    let bit_depth = details.bit_depth as u8;
 
-    let nz_width = NonZeroUsize::new(width)
+    NonZeroUsize::new(width)
         .ok_or_else(|| anyhow::anyhow!("zero-width resolution is not supported"))?;
-    let nz_height = NonZeroUsize::new(height)
+    NonZeroUsize::new(height)
         .ok_or_else(|| anyhow::anyhow!("zero-height resolution is not supported"))?;
-    let nz_bd = std::num::NonZeroU8::new(details.bit_depth as u8)
+    std::num::NonZeroU8::new(bit_depth)
         .ok_or_else(|| anyhow::anyhow!("zero bit-depth is not supported"))?;
 
     let mut frame: Frame<T> = profile::time(MetricId::ReaderBuildFrame, || {
-        FrameBuilder::new(nz_width, nz_height, details.chroma_sampling, nz_bd)
+        FrameBuilder::new(width, height, details.chroma_sampling, bit_depth)
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))
     })?;
 
-    let y_stride = NonZeroUsize::new(decoded.stride(0))
-        .ok_or_else(|| anyhow::anyhow!("luma stride is zero"))?;
+    let y_stride = decoded.stride(0);
+    NonZeroUsize::new(y_stride).ok_or_else(|| anyhow::anyhow!("luma stride is zero"))?;
     if let (Some(u_plane), Some(v_plane)) = (frame.u_plane.as_mut(), frame.v_plane.as_mut()) {
-        let u_stride = NonZeroUsize::new(decoded.stride(1))
-            .ok_or_else(|| anyhow::anyhow!("U chroma stride is zero"))?;
-        let v_stride = NonZeroUsize::new(decoded.stride(2))
-            .ok_or_else(|| anyhow::anyhow!("V chroma stride is zero"))?;
+        let u_stride = decoded.stride(1);
+        NonZeroUsize::new(u_stride).ok_or_else(|| anyhow::anyhow!("U chroma stride is zero"))?;
+        let v_stride = decoded.stride(2);
+        NonZeroUsize::new(v_stride).ok_or_else(|| anyhow::anyhow!("V chroma stride is zero"))?;
         let mut y_result = Ok(());
         let mut u_result = Ok(());
         let mut v_result = Ok(());
@@ -297,26 +298,25 @@ fn decode_frame_u8(details: &VideoDetails, decoded: &frame::Video) -> Result<Fra
     let width = details.width;
     let height = details.height;
 
-    let nz_width = NonZeroUsize::new(width)
+    NonZeroUsize::new(width)
         .ok_or_else(|| anyhow::anyhow!("zero-width resolution is not supported"))?;
-    let nz_height = NonZeroUsize::new(height)
+    NonZeroUsize::new(height)
         .ok_or_else(|| anyhow::anyhow!("zero-height resolution is not supported"))?;
-    let nz_bd = std::num::NonZeroU8::new(8).expect("non-zero constant");
 
     let mut frame: Frame<u8> = profile::time(MetricId::ReaderBuildFrame, || {
-        FrameBuilder::new(nz_width, nz_height, details.chroma_sampling, nz_bd)
+        FrameBuilder::new(width, height, details.chroma_sampling, 8)
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))
     })?;
 
-    let y_stride = NonZeroUsize::new(decoded.stride(0))
-        .ok_or_else(|| anyhow::anyhow!("luma stride is zero"))?;
+    let y_stride = decoded.stride(0);
+    NonZeroUsize::new(y_stride).ok_or_else(|| anyhow::anyhow!("luma stride is zero"))?;
     let shift = details.bit_depth.saturating_sub(8);
     if let (Some(u_plane), Some(v_plane)) = (frame.u_plane.as_mut(), frame.v_plane.as_mut()) {
-        let u_stride = NonZeroUsize::new(decoded.stride(1))
-            .ok_or_else(|| anyhow::anyhow!("U chroma stride is zero"))?;
-        let v_stride = NonZeroUsize::new(decoded.stride(2))
-            .ok_or_else(|| anyhow::anyhow!("V chroma stride is zero"))?;
+        let u_stride = decoded.stride(1);
+        NonZeroUsize::new(u_stride).ok_or_else(|| anyhow::anyhow!("U chroma stride is zero"))?;
+        let v_stride = decoded.stride(2);
+        NonZeroUsize::new(v_stride).ok_or_else(|| anyhow::anyhow!("V chroma stride is zero"))?;
         let mut y_result = Ok(());
         let mut u_result = Ok(());
         let mut v_result = Ok(());
@@ -355,26 +355,26 @@ fn decode_frame_u8(details: &VideoDetails, decoded: &frame::Video) -> Result<Fra
 
 fn copy_decoded_plane_to_u8(
     src: &[u8],
-    input_stride: NonZeroUsize,
+    input_stride: usize,
     out_plane: &mut Plane<u8>,
     shift: usize,
-) -> Result<(), av1_grain::v_frame::error::Error> {
+) -> Result<(), av1_grain::v_frame::plane::CopyError> {
     if shift == 0 {
         return out_plane.copy_from_u8_slice_with_stride(src, input_stride);
     }
 
-    let width = out_plane.width().get();
+    let width = out_plane.width();
     let row_byte_width = width * 2;
-    let byte_count = input_stride.get() * out_plane.height().get();
+    let byte_count = input_stride * out_plane.height();
     if byte_count != src.len() {
-        return Err(av1_grain::v_frame::error::Error::DataLength {
+        return Err(av1_grain::v_frame::plane::CopyError::DataLength {
             expected: byte_count,
             found: src.len(),
         });
     }
 
     for (row_idx, out_row) in out_plane.rows_mut().enumerate() {
-        let src_offset = row_idx * input_stride.get();
+        let src_offset = row_idx * input_stride;
         let src_row = &src[src_offset..src_offset + row_byte_width];
         for (out, bytes) in out_row.iter_mut().zip(src_row.chunks_exact(2)) {
             *out = (u16::from_le_bytes([bytes[0], bytes[1]]) >> shift) as u8;

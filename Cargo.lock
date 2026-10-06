@@ -90,17 +90,15 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "av1-grain"
-version = "0.4.2"
-source = "git+https://github.com/LysanderdeJong/av1-grain.git?branch=main#c615101135c7784102522d094f217cd6cb247e96"
+version = "0.5.0"
+source = "git+https://github.com/LysanderdeJong/av1-grain.git?rev=f615ca944afe6c7c93c028c7ce292e09233f1709#f615ca944afe6c7c93c028c7ce292e09233f1709"
 dependencies = [
  "anyhow",
  "arrayvec",
- "cfg-if",
  "log",
- "nom 8.0.0",
  "num-rational",
  "rayon",
- "v_frame",
+ "v_frame 0.7.0",
 ]
 
 [[package]]
@@ -534,7 +532,7 @@ dependencies = [
  "quickcheck_macros",
  "rayon",
  "tempfile",
- "v_frame",
+ "v_frame 0.5.1",
  "video-resize",
 ]
 
@@ -1291,6 +1289,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "v_frame"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06b99be99e91ea12170d453a6547324ef2df3fcd79aaf336f5b1fff88ac89d84"
+
+[[package]]
 name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1304,7 +1308,7 @@ checksum = "515bceaab47b40b7aa586eb15e854ae498bd29826d60cd7e4eab1aba726fdac4"
 dependencies = [
  "anyhow",
  "num-traits",
- "v_frame",
+ "v_frame 0.5.1",
 ]
 
 [[package]]
