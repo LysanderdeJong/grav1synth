@@ -1,14 +1,14 @@
-/// Built-in film grain presets embedded directly into the binary at compile time.
-///
-/// Presets are split into two groups:
-///
-/// **Standalone** presets (`Super8`, `MaxMid`) are used exactly as named.
-///
-/// **Format** presets (`16mm`, `Classic35`, `Modern35`) support an optional film stock
-/// modifier suffix (`-1`, `-2`, `-3`). Omitting the suffix selects the default stock
-/// (Fujifilm Eterna 250D). Example valid names: `16mm`, `16mm-1`, `Classic35-2`.
-///
-/// All lookups are case-insensitive.
+//! Built-in film grain presets embedded directly into the binary at compile time.
+//!
+//! Presets are split into two groups:
+//!
+//! **Standalone** presets (`Super8`, `MaxMid`) are used exactly as named.
+//!
+//! **Format** presets (`16mm`, `Classic35`, `Modern35`) support an optional film stock
+//! modifier suffix (`-1`, `-2`, `-3`). Omitting the suffix selects the default stock
+//! (Fujifilm Eterna 250D). Example valid names: `16mm`, `16mm-1`, `Classic35-2`.
+//!
+//! All lookups are case-insensitive.
 
 // ── Film stock modifier table ─────────────────────────────────────────────────
 
@@ -57,8 +57,8 @@ pub const FORMAT_PRESETS: &[FormatPreset] = &[
         name: "16mm",
         description: "Based on 16mm film size",
         stocks: [
-            include_str!("../grain-files/16mm_FJ_8543_VD.txt"),  // default
-            include_str!("../grain-files/16mm_FJ_8553_ET.txt"),   // -1
+            include_str!("../grain-files/16mm_FJ_8543_VD.txt"), // default
+            include_str!("../grain-files/16mm_FJ_8553_ET.txt"), // -1
             include_str!("../grain-files/16mm_KD_5207_Vis3.txt"), // -2
             include_str!("../grain-files/16mm_KD_5213_Vis3.txt"), // -3
         ],
@@ -139,4 +139,3 @@ pub fn get_preset(name: &str) -> Option<&'static str> {
 
     None
 }
-
