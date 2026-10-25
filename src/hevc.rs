@@ -39,15 +39,27 @@ pub fn inspect_hevc_grain_table(input: &std::path::Path) -> Result<Vec<GrainTabl
         if let Some(data) = packet.data() {
             if packet_has_vcl(data)? {
                 packet_data.push(data.to_vec());
-                packet_pts.push(packet.pts().map(|pts| ffmpeg_pts_to_grain_ts(pts, video_stream_time_base)));
+                packet_pts.push(
+                    packet
+                        .pts()
+                        .map(|pts| ffmpeg_pts_to_grain_ts(pts, video_stream_time_base)),
+                );
             }
         }
         if packet_data.len() >= HEVC_PACKET_BATCH {
-            params_by_frame.extend(packet_pts.drain(..).zip(parse_hevc_grain_batch(&packet_data)?));
+            params_by_frame.extend(
+                packet_pts
+                    .drain(..)
+                    .zip(parse_hevc_grain_batch(&packet_data)?),
+            );
             packet_data.clear();
         }
     }
-    params_by_frame.extend(packet_pts.drain(..).zip(parse_hevc_grain_batch(&packet_data)?));
+    params_by_frame.extend(
+        packet_pts
+            .drain(..)
+            .zip(parse_hevc_grain_batch(&packet_data)?),
+    );
 
     if params_by_frame.iter().any(|(pts, _)| pts.is_some()) {
         params_by_frame.sort_by_key(|(pts, _)| pts.unwrap_or(0));
@@ -920,7 +932,10 @@ mod tests {
         let nals = find_nals(&packet).expect("length-prefixed packet should parse");
 
         assert_eq!(nals.len(), 1);
-        assert_eq!(nals[0].format, PacketFormat::LengthPrefixed { length_size: 4 });
+        assert_eq!(
+            nals[0].format,
+            PacketFormat::LengthPrefixed { length_size: 4 }
+        );
         assert_eq!(nal_type(nals[0].data).unwrap(), 1);
     }
 

@@ -14,7 +14,8 @@ use dialoguer::Confirm;
 use ffmpeg::{codec, format};
 use grav1synth::{
     AnalyzeOptions, ApplyOptions, GrainSource, GrainTableSegment, PhotonNoiseOptions, analyze,
-    apply, hevc, misc::get_frame_count,
+    apply, hevc,
+    misc::get_frame_count,
     parser::{
         BitstreamParser,
         grain::{FilmGrainHeader, FilmGrainParams},
@@ -124,9 +125,10 @@ pub fn main() -> Result<()> {
             let source = match (grain, preset, iso) {
                 (Some(grain_path), None, None) => GrainSource::TableFile(grain_path),
                 (None, Some(preset_name), None) => GrainSource::Preset(preset_name),
-                (None, None, Some(iso_value)) => {
-                    GrainSource::PhotonNoise(PhotonNoiseOptions { iso: iso_value, chroma })
-                }
+                (None, None, Some(iso_value)) => GrainSource::PhotonNoise(PhotonNoiseOptions {
+                    iso: iso_value,
+                    chroma,
+                }),
                 // The ArgGroup on the Apply variant guarantees exactly one of grain/preset/iso
                 // is Some, so this branch can never trigger at runtime.
                 _ => unreachable!(
@@ -387,8 +389,6 @@ pub fn main() -> Result<()> {
 
     Ok(())
 }
-
-
 
 fn write_x265_aom_file<W: Write>(
     segments: &[GrainTableSegment],

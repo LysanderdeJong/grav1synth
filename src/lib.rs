@@ -123,9 +123,7 @@ pub fn analyze(opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
         }
         // A process-wide Rayon pool can only be initialized once; a pool that
         // already exists (e.g. from an earlier call in the same process) wins.
-        let _ = ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global();
+        let _ = ThreadPoolBuilder::new().num_threads(threads).build_global();
     }
 
     if opts.output.exists() && !opts.overwrite {
@@ -140,9 +138,7 @@ pub fn analyze(opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     let progress = if stderr().is_tty() {
         let pb = frame_count.map_or_else(
             || ProgressBar::new(0).with_style(spinner_style()),
-            |frame_count| {
-                ProgressBar::new(frame_count as u64).with_style(pretty_progress_style())
-            },
+            |frame_count| ProgressBar::new(frame_count as u64).with_style(pretty_progress_style()),
         );
         pb.set_draw_target(ProgressDrawTarget::stderr());
         pb.enable_steady_tick(Duration::from_millis(100));
@@ -240,7 +236,10 @@ pub fn analyze(opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     })?;
     profile::print_report();
     info!("Computed diff for {frames} frames");
-    info!("Done, wrote output file to {}", opts.output.to_string_lossy());
+    info!(
+        "Done, wrote output file to {}",
+        opts.output.to_string_lossy()
+    );
     Ok(AnalyzeReport { frames })
 }
 
@@ -413,8 +412,16 @@ pub fn apply(opts: &ApplyOptions) -> Result<ApplyReport> {
                 skipped_existing: true,
             });
         }
-        hevc::modify_hevc_grain(&opts.input, &opts.output, new_grain.as_deref(), opts.replace)?;
-        info!("Done, wrote output file to {}", opts.output.to_string_lossy());
+        hevc::modify_hevc_grain(
+            &opts.input,
+            &opts.output,
+            new_grain.as_deref(),
+            opts.replace,
+        )?;
+        info!(
+            "Done, wrote output file to {}",
+            opts.output.to_string_lossy()
+        );
         return Ok(ApplyReport {
             skipped_existing: false,
         });
@@ -422,12 +429,14 @@ pub fn apply(opts: &ApplyOptions) -> Result<ApplyReport> {
 
     let writer = format::output(&opts.output)?;
 
-    let mut parser: BitstreamParser<true> =
-        BitstreamParser::with_writer(reader, writer, new_grain);
+    let mut parser: BitstreamParser<true> = BitstreamParser::with_writer(reader, writer, new_grain);
 
     parser.modify_grain_headers()?;
 
-    info!("Done, wrote output file to {}", opts.output.to_string_lossy());
+    info!(
+        "Done, wrote output file to {}",
+        opts.output.to_string_lossy()
+    );
     Ok(ApplyReport {
         skipped_existing: false,
     })
