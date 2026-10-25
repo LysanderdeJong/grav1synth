@@ -9,6 +9,10 @@ keywords = ["video", "multimedia", "av1"]
 categories = ["multimedia", "multimedia::video", "multimedia::encoding"]
 exclude = ["/dav1d-test-data", "/tests"]
 
+[lib]
+name = "grav1synth"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0.55"
 arrayvec = "0.7.2"

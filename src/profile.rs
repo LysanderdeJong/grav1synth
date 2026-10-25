@@ -1,5 +1,5 @@
 #[derive(Clone, Copy)]
-pub(crate) enum MetricId {
+pub enum MetricId {
     DiffFramePairsTotal,
     SourceGetFrame,
     SourceFilter,
@@ -74,7 +74,7 @@ mod enabled {
         "reader_copy_v",
     ];
 
-    pub(crate) fn time<T>(id: MetricId, f: impl FnOnce() -> T) -> T {
+    pub fn time<T>(id: MetricId, f: impl FnOnce() -> T) -> T {
         let start = Instant::now();
         let result = f();
         let elapsed = start.elapsed().as_nanos();
@@ -85,7 +85,7 @@ mod enabled {
         result
     }
 
-    pub(crate) fn print_report() {
+    pub fn print_report() {
         eprintln!("grav1synth diff profile:");
         eprintln!(
             "{:<30} {:>10} {:>12} {:>12}",
@@ -105,14 +105,14 @@ mod enabled {
 }
 
 #[cfg(feature = "profile-diff")]
-pub(crate) use enabled::{print_report, time};
+pub use enabled::{print_report, time};
 
 #[cfg(not(feature = "profile-diff"))]
 #[inline(always)]
-pub(crate) fn time<T>(_: MetricId, f: impl FnOnce() -> T) -> T {
+pub fn time<T>(_: MetricId, f: impl FnOnce() -> T) -> T {
     f()
 }
 
 #[cfg(not(feature = "profile-diff"))]
 #[inline(always)]
-pub(crate) fn print_report() {}
+pub fn print_report() {}

@@ -1,141 +1,30 @@
-mod filters;
-mod hevc;
-mod misc;
-pub mod parser;
-pub mod presets;
-mod profile;
-pub mod reader;
-
 use std::{
     env,
     fs::{File, read_to_string},
-    io::{BufWriter, Write, stderr},
-    num::NonZeroU8,
+    io::{BufWriter, Write},
     path::PathBuf,
-    sync::mpsc::sync_channel,
-    time::Duration,
 };
 
 use anyhow::{Result, anyhow, bail};
 #[cfg(feature = "unstable")]
 use av1_grain::estimate_plane_noise;
-use av1_grain::{
-    DiffGenerator, TransferFunction, generate_photon_noise_params, parse_grain_table,
-    v_frame::{frame::Frame, pixel::Pixel},
-};
+use av1_grain::parse_grain_table;
 use clap::{ArgGroup, Parser, Subcommand};
-use crossterm::tty::IsTty;
 use dialoguer::Confirm;
-use ffmpeg::{
-    codec,
-    ffi::{AVColorRange, AVColorTransferCharacteristic},
-    format,
+use ffmpeg::{codec, format};
+use grav1synth::{
+    AnalyzeOptions, ApplyOptions, GrainSource, GrainTableSegment, PhotonNoiseOptions, analyze,
+    apply, hevc, misc::get_frame_count,
+    parser::{
+        BitstreamParser,
+        grain::{FilmGrainHeader, FilmGrainParams},
+    },
+    presets,
+    reader::BitstreamReader,
+    write_film_grain_segment,
 };
-use indicatif::{HumanDuration, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use num_rational::Rational32;
-use parser::grain::{FilmGrainHeader, FilmGrainParams};
-use rayon::ThreadPoolBuilder;
-use v_frame_05::pixel::Pixel as Pixel05;
-
-use crate::{
-    filters::FilterChain, misc::get_frame_count, parser::BitstreamParser, reader::BitstreamReader,
-};
-
-const PROGRESS_CHARS: &str = "█▉▊▋▌▍▎▏  ";
-const INDICATIF_PROGRESS_TEMPLATE: &str = if cfg!(windows) {
-    // Do not use a spinner on Windows since the default console cannot display
-    // the characters used for the spinner
-    "{elapsed_precise:.bold} ▕{wide_bar:.blue/white.dim}▏ {percent:.bold}  {pos} ({fps:.bold}, eta {fixed_eta}{msg})"
-} else {
-    "{spinner:.green.bold} {elapsed_precise:.bold} ▕{wide_bar:.blue/white.dim}▏ {percent:.bold}  {pos} ({fps:.bold}, eta {fixed_eta}{msg})"
-};
-const INDICATIF_SPINNER_TEMPLATE: &str = if cfg!(windows) {
-    // Do not use a spinner on Windows since the default console cannot display
-    // the characters used for the spinner
-    "{elapsed_precise:.bold} [{wide_bar:.blue/white.dim}]  {pos} frames ({fps:.bold})"
-} else {
-    "{spinner:.green.bold} {elapsed_precise:.bold} [{wide_bar:.blue/white.dim}]  {pos} frames ({fps:.bold})"
-};
-
-fn pretty_progress_style() -> ProgressStyle {
-    ProgressStyle::default_bar()
-        .template(INDICATIF_PROGRESS_TEMPLATE)
-        .unwrap()
-        .with_key(
-            "fps",
-            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                if state.pos() == 0 || state.elapsed().as_secs_f32() < f32::EPSILON {
-                    write!(w, "0 fps").unwrap();
-                } else {
-                    let fps = state.pos() as f32 / state.elapsed().as_secs_f32();
-                    if fps < 1.0 {
-                        write!(w, "{:.2} s/fr", 1.0 / fps).unwrap();
-                    } else {
-                        write!(w, "{fps:.2} fps").unwrap();
-                    }
-                }
-            },
-        )
-        .with_key(
-            "fixed_eta",
-            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                if state.pos() == 0 || state.elapsed().as_secs_f32() < f32::EPSILON {
-                    write!(w, "unknown").unwrap();
-                } else {
-                    let spf = state.elapsed().as_secs_f32() / state.pos() as f32;
-                    let remaining = state.len().unwrap_or(0) - state.pos();
-                    write!(
-                        w,
-                        "{:#}",
-                        HumanDuration(Duration::from_secs_f32(spf * remaining as f32))
-                    )
-                    .unwrap();
-                }
-            },
-        )
-        .with_key(
-            "pos",
-            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                write!(w, "{}/{}", state.pos(), state.len().unwrap_or(0)).unwrap();
-            },
-        )
-        .with_key(
-            "percent",
-            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                write!(w, "{:>3.0}%", state.fraction() * 100_f32).unwrap();
-            },
-        )
-        .progress_chars(PROGRESS_CHARS)
-}
-
-fn spinner_style() -> ProgressStyle {
-    ProgressStyle::default_spinner()
-        .template(INDICATIF_SPINNER_TEMPLATE)
-        .unwrap()
-        .with_key(
-            "fps",
-            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                if state.pos() == 0 || state.elapsed().as_secs_f32() < f32::EPSILON {
-                    write!(w, "0 fps").unwrap();
-                } else {
-                    let fps = state.pos() as f32 / state.elapsed().as_secs_f32();
-                    if fps < 1.0 {
-                        write!(w, "{:.2} s/fr", 1.0 / fps).unwrap();
-                    } else {
-                        write!(w, "{fps:.2} fps").unwrap();
-                    }
-                }
-            },
-        )
-        .with_key(
-            "pos",
-            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                write!(w, "{}", state.pos()).unwrap();
-            },
-        )
-        .progress_chars(PROGRESS_CHARS)
-}
 
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cognitive_complexity)]
@@ -232,146 +121,25 @@ pub fn main() -> Result<()> {
             chroma,
             replace,
         } => {
-            if input == output {
-                error!(
-                    "Input and output paths are the same. This is probably a typo, because this \
-                     would overwrite your input. Exiting."
-                );
-                return Ok(());
-            }
-
-            if output.exists()
-                && !overwrite
-                && !Confirm::new()
-                    .with_prompt(format!(
-                        "File {} exists. Overwrite?",
-                        output.to_string_lossy()
-                    ))
-                    .interact()?
-            {
-                warn!("Not overwriting existing file. Exiting.");
-                return Ok(());
-            }
-
-            let reader = BitstreamReader::open(&input)?;
-            let codec_id = reader.get_video_stream()?.parameters().id();
-
-            if codec_id != codec::Id::HEVC {
-                // Check whether the input already carries AV1 film grain headers.
-                // We only need to read the Sequence Header OBU (always in the first video packet)
-                // to check the film_grain_params_present flag, so this is effectively instant.
-                let check_reader = BitstreamReader::open(&input)?;
-                let mut check_parser: BitstreamParser<false> = BitstreamParser::new(check_reader);
-                let has_existing_grain = check_parser.film_grain_params_present()?;
-
-                if has_existing_grain && !replace {
-                    info!(
-                        "Skipped: grain headers already exist in this file. Re-run with '--replace' \
-                         to replace the existing grain headers."
-                    );
-                    return Ok(());
-                }
-            }
-
-            // Build the grain segments from whichever source was provided.
-            let new_grain = match (grain, preset, iso) {
-                (Some(grain_path), None, None) => {
-                    let grain_data = read_to_string(grain_path)?;
-                    let new_headers = parse_grain_table(&grain_data)?;
-                    Some(
-                        new_headers
-                            .into_iter()
-                            .map(|h| h.into())
-                            .collect::<Vec<_>>(),
-                    )
-                }
-                (None, Some(preset_name), None) => {
-                    let grain_data = presets::get_preset(&preset_name).ok_or_else(|| {
-                        // Enumerate valid names: standalones + format bases + format+suffix combos.
-                        let mut known: Vec<String> = presets::STANDALONE_PRESETS
-                            .iter()
-                            .map(|p| p.name.to_string())
-                            .collect();
-                        for fp in presets::FORMAT_PRESETS {
-                            known.push(fp.name.to_string());
-                            for stock in &presets::FILM_STOCKS[1..] {
-                                known.push(format!("{}{}", fp.name, stock.suffix));
-                            }
-                        }
-                        anyhow!(
-                            "Unknown preset '{preset_name}'. Valid presets are:\n  {}\n\
-                             Run `grav1synth presets` for the full list.",
-                            known.join(", ")
-                        )
-                    })?;
-                    let new_headers = parse_grain_table(grain_data)?;
-                    Some(
-                        new_headers
-                            .into_iter()
-                            .map(|h| h.into())
-                            .collect::<Vec<_>>(),
-                    )
-                }
+            let source = match (grain, preset, iso) {
+                (Some(grain_path), None, None) => GrainSource::TableFile(grain_path),
+                (None, Some(preset_name), None) => GrainSource::Preset(preset_name),
                 (None, None, Some(iso_value)) => {
-                    // SAFETY: We extract the items we need from the struct within the unsafe
-                    // block, so there's no possibility of use-after-free later.
-                    let (width, height, trc, range) = unsafe {
-                        let video_stream = reader.get_video_stream().unwrap();
-                        let params = video_stream.parameters().as_ptr();
-                        (
-                            (*params).width as u32,
-                            (*params).height as u32,
-                            (*params).color_trc,
-                            (*params).color_range,
-                        )
-                    };
-                    let grain_data = generate_photon_noise_params(
-                        0,
-                        u64::MAX,
-                        av1_grain::NoiseGenArgs {
-                            iso_setting: iso_value,
-                            width,
-                            height,
-                            transfer_function: if trc == AVColorTransferCharacteristic::SMPTE2084 {
-                                TransferFunction::SMPTE2084
-                            } else {
-                                TransferFunction::BT1886
-                            },
-                            chroma_grain: chroma,
-                            full_range: range == AVColorRange::JPEG,
-                            random_seed: None,
-                        },
-                    );
-                    Some(vec![grain_data.into()])
+                    GrainSource::PhotonNoise(PhotonNoiseOptions { iso: iso_value, chroma })
                 }
-                // The ArgGroup on the Apply variant guarantees exactly one of grain/preset/iso is
-                // Some, so none of the remaining branches can be reached at runtime.
+                // The ArgGroup on the Apply variant guarantees exactly one of grain/preset/iso
+                // is Some, so this branch can never trigger at runtime.
                 _ => unreachable!(
                     "clap ArgGroup enforces exactly one of --grain, --preset, or --iso"
                 ),
             };
-
-            if codec_id == codec::Id::HEVC {
-                if !replace && hevc::has_hevc_grain(&input)? {
-                    info!(
-                        "Skipped: HEVC stream already contains x265 AFGS1 SEI. Re-run with \
-                         '--replace' to replace the existing grain SEI."
-                    );
-                    return Ok(());
-                }
-                hevc::modify_hevc_grain(&input, &output, new_grain.as_deref(), replace)?;
-                info!("Done, wrote output file to {}", output.to_string_lossy());
-                return Ok(());
-            }
-
-            let writer = format::output(&output)?;
-
-            let mut parser: BitstreamParser<true> =
-                BitstreamParser::with_writer(reader, writer, new_grain);
-
-            parser.modify_grain_headers()?;
-
-            info!("Done, wrote output file to {}", output.to_string_lossy());
+            apply(&ApplyOptions {
+                input,
+                output,
+                overwrite,
+                source,
+                replace,
+            })?;
         }
         Commands::Presets => {
             println!("Built-in film grain presets (use with `apply --preset <NAME>`):\n");
@@ -455,162 +223,14 @@ pub fn main() -> Result<()> {
             filters,
             threads,
         } => {
-            if source == output || denoised == output {
-                error!(
-                    "Input and output paths are the same. This is probably a typo, because this \
-                     would overwrite your input. Exiting."
-                );
-                return Ok(());
-            }
-
-            if source == denoised {
-                error!(
-                    "Source and denoised paths are the same. This is probably a typo, because \
-                     this would always compute an empty diff. Exiting."
-                );
-                return Ok(());
-            }
-
-            let filters = match filters {
-                Some(f) => {
-                    let f = FilterChain::new(&f);
-                    if let Err(e) = f {
-                        error!("Invalid filter chain: {e}");
-                        return Ok(());
-                    }
-                    Some(f.unwrap())
-                }
-                None => None,
-            };
-
-            if let Some(threads) = threads {
-                if threads == 0 {
-                    bail!("--threads must be greater than zero");
-                }
-                ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .build_global()?;
-            }
-
-            if output.exists()
-                && !overwrite
-                && !Confirm::new()
-                    .with_prompt(format!(
-                        "File {} exists. Overwrite?",
-                        output.to_string_lossy()
-                    ))
-                    .interact()?
-            {
-                warn!("Not overwriting existing file. Exiting.");
-                return Ok(());
-            }
-
-            let frame_count = get_frame_count(&source).ok();
-
-            let progress = if stderr().is_tty() {
-                let pb = frame_count.map_or_else(
-                    || ProgressBar::new(0).with_style(spinner_style()),
-                    |frame_count| {
-                        ProgressBar::new(frame_count as u64).with_style(pretty_progress_style())
-                    },
-                );
-                pb.set_draw_target(ProgressDrawTarget::stderr());
-                pb.enable_steady_tick(Duration::from_millis(100));
-                pb.reset();
-                pb.reset_eta();
-                pb.reset_elapsed();
-                pb.set_position(0);
-                pb
-            } else {
-                ProgressBar::hidden()
-            };
-
-            let source_reader = BitstreamReader::open(&source)?;
-            let denoised_reader = BitstreamReader::open(&denoised)?;
-            let frame_rate = source_reader.get_video_details().frame_rate;
-            let source_bd = source_reader.get_video_details().bit_depth;
-            let denoised_bd = denoised_reader.get_video_details().bit_depth;
-            let can_preconvert_to_u8 = filters.as_ref().is_none_or(FilterChain::is_crop_only);
-            let differ_source_bd = if can_preconvert_to_u8 { 8 } else { source_bd };
-            let differ_denoised_bd = if can_preconvert_to_u8 { 8 } else { denoised_bd };
-            let mut differ = DiffGenerator::new(
-                num_rational::Rational64::new(
-                    i64::from(*frame_rate.numer()),
-                    i64::from(*frame_rate.denom()),
-                ),
-                differ_source_bd,
-                differ_denoised_bd,
-            );
-            let non_zero_source_bd =
-                NonZeroU8::new(source_bd as u8).ok_or_else(|| anyhow!("bd should not be 0"))?;
-
-            let frames = profile::time(
-                profile::MetricId::DiffFramePairsTotal,
-                || -> Result<usize> {
-                    if can_preconvert_to_u8 {
-                        return diff_frame_pairs_preconverted_u8(
-                            source_reader,
-                            denoised_reader,
-                            filters,
-                            &mut differ,
-                            &progress,
-                        );
-                    }
-
-                    match (source_bd, denoised_bd) {
-                        (8, 8) => diff_frame_pairs::<u8, u8>(
-                            source_reader,
-                            denoised_reader,
-                            non_zero_source_bd,
-                            filters,
-                            &mut differ,
-                            &progress,
-                        ),
-                        (8, 9..=16) => diff_frame_pairs::<u8, u16>(
-                            source_reader,
-                            denoised_reader,
-                            non_zero_source_bd,
-                            filters,
-                            &mut differ,
-                            &progress,
-                        ),
-                        (9..=16, 8) => diff_frame_pairs::<u16, u8>(
-                            source_reader,
-                            denoised_reader,
-                            non_zero_source_bd,
-                            filters,
-                            &mut differ,
-                            &progress,
-                        ),
-                        (9..=16, 9..=16) => diff_frame_pairs::<u16, u16>(
-                            source_reader,
-                            denoised_reader,
-                            non_zero_source_bd,
-                            filters,
-                            &mut differ,
-                            &progress,
-                        ),
-                        _ => {
-                            bail!("Bit depths not between 8-16 are not currently supported");
-                        }
-                    }
-                },
-            )?;
-            progress.finish();
-
-            let grain_tables = profile::time(profile::MetricId::DifferFinish, || differ.finish());
-            profile::time(profile::MetricId::OutputWrite, || -> Result<()> {
-                let mut output_file = BufWriter::new(File::create(&output)?);
-                writeln!(&mut output_file, "filmgrn1")?;
-                for segment in grain_tables {
-                    write_film_grain_segment(&segment.into(), &mut output_file)?;
-                }
-                output_file.flush()?;
-                Ok(())
+            analyze(&AnalyzeOptions {
+                source,
+                denoised,
+                output,
+                overwrite,
+                filters,
+                threads,
             })?;
-            profile::print_report();
-            info!("Computed diff for {frames} frames");
-            info!("Done, wrote output file to {}", output.to_string_lossy());
         }
         Commands::X265Aom {
             grain,
@@ -768,255 +388,7 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
-fn diff_frame_pairs<T: Pixel + Pixel05 + Send + 'static, U: Pixel + Pixel05 + Send + 'static>(
-    mut source_reader: BitstreamReader,
-    mut denoised_reader: BitstreamReader,
-    source_bd: NonZeroU8,
-    filters: Option<FilterChain>,
-    differ: &mut DiffGenerator,
-    progress: &ProgressBar,
-) -> Result<usize> {
-    let (source_sender, source_receiver) = sync_channel::<Result<Option<Frame<T>>>>(1);
-    let source_producer = std::thread::spawn(move || {
-        loop {
-            let mut frame = profile::time(profile::MetricId::SourceGetFrame, || {
-                source_reader.get_frame::<T>()
-            });
-            if let Some(f) = filters.as_ref() {
-                frame = profile::time(profile::MetricId::SourceFilter, || {
-                    frame.map(|opt| opt.map(|source_frame| f.apply(source_frame, source_bd)))
-                });
-            }
-            let should_stop = !matches!(frame, Ok(Some(_)));
 
-            if source_sender.send(frame).is_err() || should_stop {
-                break;
-            }
-        }
-    });
-    let (denoised_sender, denoised_receiver) = sync_channel::<Result<Option<Frame<U>>>>(1);
-    let denoised_producer = std::thread::spawn(move || {
-        loop {
-            let frame = profile::time(profile::MetricId::DenoisedGetFrame, || {
-                denoised_reader.get_frame::<U>()
-            });
-            let should_stop = !matches!(frame, Ok(Some(_)));
-
-            if denoised_sender.send(frame).is_err() || should_stop {
-                break;
-            }
-        }
-    });
-
-    let mut frames = 0usize;
-    let mut result = Ok(());
-    loop {
-        debug!("Diffing next frame");
-        let source_msg = profile::time(profile::MetricId::ConsumerRecv, || source_receiver.recv());
-        let denoised_msg =
-            profile::time(profile::MetricId::ConsumerRecv, || denoised_receiver.recv());
-        match (source_msg, denoised_msg) {
-            (Ok(Ok(Some(source_frame))), Ok(Ok(Some(denoised_frame)))) => {
-                if let Err(e) = profile::time(profile::MetricId::DifferDiffFrame, || {
-                    differ.diff_frame(&source_frame, &denoised_frame)
-                }) {
-                    result = Err(e);
-                    break;
-                }
-                frames += 1;
-                progress.inc(1);
-            }
-            (Ok(Ok(None)), Ok(Ok(None))) => {
-                break;
-            }
-            (Ok(Ok(_)), Ok(Ok(_))) => {
-                warn!(
-                    "Videos did not have equal frame counts. Resulting grain table may not be as \
-                     expected."
-                );
-                break;
-            }
-            (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
-                result = Err(e);
-                break;
-            }
-            (Err(_), _) | (_, Err(_)) => {
-                break;
-            }
-        }
-    }
-
-    drop(source_receiver);
-    drop(denoised_receiver);
-    source_producer
-        .join()
-        .map_err(|_| anyhow!("source read-ahead thread panicked"))?;
-    denoised_producer
-        .join()
-        .map_err(|_| anyhow!("denoised read-ahead thread panicked"))?;
-    result?;
-
-    Ok(frames)
-}
-
-fn diff_frame_pairs_preconverted_u8(
-    mut source_reader: BitstreamReader,
-    mut denoised_reader: BitstreamReader,
-    filters: Option<FilterChain>,
-    differ: &mut DiffGenerator,
-    progress: &ProgressBar,
-) -> Result<usize> {
-    let (source_sender, source_receiver) = sync_channel::<Result<Option<Frame<u8>>>>(1);
-    let source_producer = std::thread::spawn(move || {
-        let filter_bd = NonZeroU8::new(8).expect("non-zero constant");
-        loop {
-            let mut frame = profile::time(profile::MetricId::SourceGetFrame, || {
-                source_reader.get_frame_u8()
-            });
-            if let Some(f) = filters.as_ref() {
-                frame = profile::time(profile::MetricId::SourceFilter, || {
-                    frame.map(|opt| opt.map(|source_frame| f.apply(source_frame, filter_bd)))
-                });
-            }
-            let should_stop = !matches!(frame, Ok(Some(_)));
-
-            if source_sender.send(frame).is_err() || should_stop {
-                break;
-            }
-        }
-    });
-    let (denoised_sender, denoised_receiver) = sync_channel::<Result<Option<Frame<u8>>>>(1);
-    let denoised_producer = std::thread::spawn(move || {
-        loop {
-            let frame = profile::time(profile::MetricId::DenoisedGetFrame, || {
-                denoised_reader.get_frame_u8()
-            });
-            let should_stop = !matches!(frame, Ok(Some(_)));
-
-            if denoised_sender.send(frame).is_err() || should_stop {
-                break;
-            }
-        }
-    });
-
-    let mut frames = 0usize;
-    let mut result = Ok(());
-    loop {
-        debug!("Diffing next frame");
-        let source_msg = profile::time(profile::MetricId::ConsumerRecv, || source_receiver.recv());
-        let denoised_msg =
-            profile::time(profile::MetricId::ConsumerRecv, || denoised_receiver.recv());
-        match (source_msg, denoised_msg) {
-            (Ok(Ok(Some(source_frame))), Ok(Ok(Some(denoised_frame)))) => {
-                if let Err(e) = profile::time(profile::MetricId::DifferDiffFrame, || {
-                    differ.diff_frame(&source_frame, &denoised_frame)
-                }) {
-                    result = Err(e);
-                    break;
-                }
-                frames += 1;
-                progress.inc(1);
-            }
-            (Ok(Ok(None)), Ok(Ok(None))) => {
-                break;
-            }
-            (Ok(Ok(_)), Ok(Ok(_))) => {
-                warn!(
-                    "Videos did not have equal frame counts. Resulting grain table may not be as \
-                     expected."
-                );
-                break;
-            }
-            (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
-                result = Err(e);
-                break;
-            }
-            (Err(_), _) | (_, Err(_)) => {
-                break;
-            }
-        }
-    }
-
-    drop(source_receiver);
-    drop(denoised_receiver);
-    source_producer
-        .join()
-        .map_err(|_| anyhow!("source read-ahead thread panicked"))?;
-    denoised_producer
-        .join()
-        .map_err(|_| anyhow!("denoised read-ahead thread panicked"))?;
-    result?;
-
-    Ok(frames)
-}
-
-fn write_film_grain_segment(
-    segment: &GrainTableSegment,
-    output: &mut BufWriter<File>,
-) -> anyhow::Result<()> {
-    let params = &segment.grain_params;
-
-    writeln!(
-        output,
-        "E {} {} 1 {} 1",
-        segment.start_time, segment.end_time, params.grain_seed,
-    )?;
-    writeln!(
-        output,
-        "\tp {} {} {} {} {} {} {} {} {} {} {} {}",
-        params.ar_coeff_lag,
-        params.ar_coeff_shift,
-        params.grain_scale_shift,
-        params.scaling_shift,
-        u8::from(params.chroma_scaling_from_luma),
-        u8::from(params.overlap_flag),
-        params.cb_mult,
-        params.cb_luma_mult,
-        params.cb_offset,
-        params.cr_mult,
-        params.cr_luma_mult,
-        params.cr_offset
-    )?;
-
-    write!(output, "\tsY {} ", params.scaling_points_y.len())?;
-    for point in &params.scaling_points_y {
-        write!(output, " {} {}", point[0], point[1])?;
-    }
-    writeln!(output)?;
-
-    write!(output, "\tsCb {}", params.scaling_points_cb.len())?;
-    for point in &params.scaling_points_cb {
-        write!(output, " {} {}", point[0], point[1])?;
-    }
-    writeln!(output)?;
-
-    write!(output, "\tsCr {}", params.scaling_points_cr.len())?;
-    for point in &params.scaling_points_cr {
-        write!(output, " {} {}", point[0], point[1])?;
-    }
-    writeln!(output)?;
-
-    write!(output, "\tcY")?;
-    for coeff in &params.ar_coeffs_y {
-        write!(output, " {}", *coeff)?;
-    }
-    writeln!(output)?;
-
-    write!(output, "\tcCb")?;
-    for coeff in &params.ar_coeffs_cb {
-        write!(output, " {}", *coeff)?;
-    }
-    writeln!(output)?;
-
-    write!(output, "\tcCr")?;
-    for coeff in &params.ar_coeffs_cr {
-        write!(output, " {}", *coeff)?;
-    }
-    writeln!(output)?;
-
-    Ok(())
-}
 
 fn write_x265_aom_file<W: Write>(
     segments: &[GrainTableSegment],
@@ -1169,24 +541,6 @@ fn parse_fps(value: &str) -> anyhow::Result<Rational32> {
     Ok(Rational32::new((fps * 1000.0).round() as i32, 1000))
 }
 
-#[derive(Debug, Clone)]
-pub struct GrainTableSegment {
-    pub start_time: u64,
-    pub end_time: u64,
-    pub grain_params: FilmGrainParams,
-}
-
-impl From<av1_grain::GrainTableSegment> for GrainTableSegment {
-    fn from(data: av1_grain::GrainTableSegment) -> Self {
-        GrainTableSegment {
-            start_time: data.start_time,
-            end_time: data.end_time,
-            grain_params: data.into(),
-        }
-    }
-}
-
-// I don't know why this is the base unit for a timestamp but it is. 1/10000000
 // of a second.
 const TIMESTAMP_BASE_UNIT: f64 = 10_000_000f64;
 
