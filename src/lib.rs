@@ -46,7 +46,7 @@ use v_frame_05::pixel::Pixel as Pixel05;
 
 use crate::{
     filters::FilterChain,
-    parser::{BitstreamParser, pts_to_grain_ts},
+    parser::{BitstreamParser, FrameClock},
     reader::BitstreamReader,
     tools::{Launcher, MediaInfo, PacketReader, Remuxer, frame_count, probe},
 };
@@ -476,9 +476,10 @@ pub fn modify_av1_grain(
     let mut remuxer = Remuxer::start(launcher, input, output, info, &timing)?;
     let mut parser = BitstreamParser::with_grain(grain);
     let mut extradata = None;
+    let mut clock = FrameClock::new(info.time_base, info.r_frame_rate);
     for packet in reader {
         let mut packet = packet?;
-        let packet_ts = pts_to_grain_ts(packet.pts.unwrap_or_default(), info.time_base);
+        let packet_ts = clock.grain_ts(packet.pts.unwrap_or_default());
         packet.data = parser.modify_packet(&packet.data, packet_ts)?;
         let extradata = extradata
             .get_or_insert_with(|| av1c_with_sequence_header(&info.extradata, &packet.data));

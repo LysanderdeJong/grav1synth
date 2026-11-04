@@ -87,6 +87,65 @@ pub fn pts_to_grain_ts(pts: i64, (num, den): (u64, u64)) -> u64 {
     (pts as u64 * num * 10_000_000u64).div_ceil(den)
 }
 
+/// Maps packet pts to grain table time the way libaom does (the frame's presentation time),
+/// undoing container rounding.
+///
+/// Containers with a coarse time base (Matroska: 1 ms) store each frame time rounded, so frame 2
+/// at 24 fps reads as 83 ms instead of 83.33 ms and would fall into the table segment before
+/// the one libaom picks. When a pts is within half a time-base unit of a frame time on the
+/// `frame_rate` grid (anchored at the first pts), the exact frame time is used. Other pts (VFR)
+/// are used as they are.
+#[derive(Debug, Clone)]
+pub struct FrameClock {
+    time_base: (u64, u64),
+    frame_rate: (u64, u64),
+    start: Option<i64>,
+}
+
+impl FrameClock {
+    /// `time_base` and `frame_rate` as (num, den); a zero `frame_rate` disables snapping.
+    #[must_use]
+    pub const fn new(time_base: (u64, u64), frame_rate: (u64, u64)) -> Self {
+        Self {
+            time_base,
+            frame_rate,
+            start: None,
+        }
+    }
+
+    /// Grain table time (100ns units, rounded up) of the packet with `pts`.
+    pub fn grain_ts(&mut self, pts: i64) -> u64 {
+        let ((tb_num, tb_den), (fps_num, fps_den)) = (self.time_base, self.frame_rate);
+        let start = *self.start.get_or_insert(pts);
+        if pts < 0 || tb_den == 0 || fps_num == 0 || fps_den == 0 {
+            return pts_to_grain_ts(pts, self.time_base);
+        }
+        // Times in units of 1 / (tb_den * fps_num) seconds.
+        let (tb_num, tb_den, fps_num, fps_den) = (
+            i128::from(tb_num),
+            i128::from(tb_den),
+            i128::from(fps_num),
+            i128::from(fps_den),
+        );
+        let time = i128::from(pts) * tb_num * fps_num;
+        let origin = i128::from(start) * tb_num * fps_num;
+        let frame = fps_den * tb_den;
+        let index = (2 * (time - origin) + frame).div_euclid(2 * frame);
+        let on_grid = origin + index * frame;
+        let time = if 2 * (time - on_grid).abs() <= tb_num * fps_num {
+            on_grid
+        } else {
+            time
+        };
+        if time <= 0 {
+            return 0;
+        }
+        let unit = tb_den * fps_num;
+        let ticks = (time * 10_000_000 + unit - 1) / unit;
+        u64::try_from(ticks).unwrap_or(u64::MAX)
+    }
+}
+
 impl<const WRITE: bool> BitstreamParser<WRITE> {
     /// Parse every OBU of one packet. `collect` records each frame's grain header.
     fn parse_packet(&mut self, mut input: &[u8], packet_ts: u64, collect: bool) -> Result<()> {
@@ -366,6 +425,44 @@ mod tests {
         assert_eq!(pts_to_grain_ts(1001, (1, 24_000)), 417_084);
         assert_eq!(pts_to_grain_ts(-5, (1, 1000)), 0);
         assert_eq!(pts_to_grain_ts(5, (1, 0)), 0);
+    }
+
+    #[test]
+    fn frame_clock_undoes_millisecond_rounding_on_the_frame_grid() {
+        let mut clock = FrameClock::new((1, 1000), (24, 1));
+        // 0, 41.67, 83.33, 125 ms stored as 0, 42, 83, 125.
+        let ticks: Vec<u64> = [0, 42, 83, 125].map(|pts| clock.grain_ts(pts)).to_vec();
+        assert_eq!(ticks, [0, 416_667, 833_334, 1_250_000]);
+        // Exactly what frame index / frame rate gives, as libaom sees it.
+        assert!(
+            ticks
+                .iter()
+                .enumerate()
+                .all(|(n, &t)| t == (n as u64 * 10_000_000).div_ceil(24))
+        );
+    }
+
+    #[test]
+    fn frame_clock_anchors_the_grid_at_the_first_pts() {
+        // 23.976 fps starting at 10 s in a 1 ms time base: 10000, 10042, 10083 ms.
+        let mut clock = FrameClock::new((1, 1000), (24_000, 1001));
+        assert_eq!(clock.grain_ts(10_000), 100_000_000);
+        assert_eq!(clock.grain_ts(10_042), 100_417_084);
+        assert_eq!(clock.grain_ts(10_083), 100_834_167);
+    }
+
+    #[test]
+    fn frame_clock_keeps_off_grid_and_exact_timestamps() {
+        // VFR: 60 ms is not within 0.5 ms of a 24 fps frame time.
+        let mut clock = FrameClock::new((1, 1000), (24, 1));
+        assert_eq!(clock.grain_ts(0), 0);
+        assert_eq!(clock.grain_ts(60), 600_000);
+        // A fine time base already holds the exact time.
+        let mut clock = FrameClock::new((1, 90_000), (24, 1));
+        assert_eq!(clock.grain_ts(3750), pts_to_grain_ts(3750, (1, 90_000)));
+        // No frame rate: plain conversion.
+        let mut clock = FrameClock::new((1, 1000), (0, 0));
+        assert_eq!(clock.grain_ts(83), 830_000);
     }
 
     #[cfg(feature = "dav1d_tests")]

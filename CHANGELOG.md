@@ -9,6 +9,7 @@
   matches the bitstream.
 - `diff` no longer drops frames when the AV1 decoder holds frames back, and fails on decode
   and read errors instead of ignoring them.
+- `apply` maps AV1 packets to grain table segments by frame time as libaom does, undoing container rounding: in a 1 ms time base (Matroska) a frame stored as 83 ms is matched as 83.33 ms, so it no longer lands in the segment before. VFR timestamps are used as they are.
 - `tests/fixtures`: fixture generator, golden recorder and goldens for parity checks.
 - Support ffmpeg 9.0
 - Merge `apply` and `generate` into a single `apply` command. `--grain <FILE>` applies
