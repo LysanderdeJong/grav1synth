@@ -1,0 +1,159 @@
+{
+    "programs": [
+
+    ],
+    "stream_groups": [
+
+    ],
+    "streams": [
+        {
+            "index": 0,
+            "codec_name": "av1",
+            "profile": "Main",
+            "codec_type": "video",
+            "codec_tag_string": "av01",
+            "width": 128,
+            "height": 72,
+            "sample_aspect_ratio": "1:1",
+            "pix_fmt": "yuv420p10le",
+            "color_range": "tv",
+            "r_frame_rate": "180/1",
+            "avg_frame_rate": "7200/109",
+            "time_base": "1/90000",
+            "start_pts": 0,
+            "extradata_size": 17,
+            "disposition": {
+                "default": 1,
+                "dub": 0,
+                "original": 0,
+                "comment": 0,
+                "lyrics": 0,
+                "karaoke": 0,
+                "forced": 0,
+                "hearing_impaired": 0,
+                "visual_impaired": 0,
+                "clean_effects": 0,
+                "attached_pic": 0,
+                "timed_thumbnails": 0,
+                "non_diegetic": 0,
+                "captions": 0,
+                "descriptions": 0,
+                "metadata": 0,
+                "dependent": 0,
+                "still_image": 0,
+                "multilayer": 0
+            },
+            "tags": {
+                "language": "und",
+                "handler_name": "VideoHandler",
+                "encoder": "<normalised>"
+            }
+        },
+        {
+            "index": 1,
+            "codec_name": "aac",
+            "profile": "LC",
+            "codec_type": "audio",
+            "codec_tag_string": "mp4a",
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/48000",
+            "start_pts": 0,
+            "extradata_size": 5,
+            "disposition": {
+                "default": 1,
+                "dub": 0,
+                "original": 0,
+                "comment": 0,
+                "lyrics": 0,
+                "karaoke": 0,
+                "forced": 0,
+                "hearing_impaired": 0,
+                "visual_impaired": 0,
+                "clean_effects": 0,
+                "attached_pic": 0,
+                "timed_thumbnails": 0,
+                "non_diegetic": 0,
+                "captions": 0,
+                "descriptions": 0,
+                "metadata": 0,
+                "dependent": 0,
+                "still_image": 0,
+                "multilayer": 0
+            },
+            "tags": {
+                "language": "und",
+                "handler_name": "SoundHandler"
+            }
+        },
+        {
+            "index": 2,
+            "codec_name": "bin_data",
+            "codec_type": "data",
+            "codec_tag_string": "text",
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/720000",
+            "start_pts": 0,
+            "extradata_size": 63,
+            "disposition": {
+                "default": 0,
+                "dub": 0,
+                "original": 0,
+                "comment": 0,
+                "lyrics": 0,
+                "karaoke": 0,
+                "forced": 0,
+                "hearing_impaired": 0,
+                "visual_impaired": 0,
+                "clean_effects": 0,
+                "attached_pic": 0,
+                "timed_thumbnails": 0,
+                "non_diegetic": 0,
+                "captions": 0,
+                "descriptions": 0,
+                "metadata": 0,
+                "dependent": 0,
+                "still_image": 0,
+                "multilayer": 0
+            },
+            "tags": {
+                "language": "eng",
+                "handler_name": "SubtitleHandler"
+            }
+        }
+    ],
+    "chapters": [
+        {
+            "id": 0,
+            "time_base": "1/720000",
+            "start": 0,
+            "start_time": "0.000000",
+            "end": 288000,
+            "end_time": "0.400000",
+            "tags": {
+                "title": "Chapter one"
+            }
+        },
+        {
+            "id": 1,
+            "time_base": "1/720000",
+            "start": 288000,
+            "start_time": "0.400000",
+            "end": 576000,
+            "end_time": "0.800000",
+            "tags": {
+                "title": "Chapter two"
+            }
+        }
+    ],
+    "format": {
+        "tags": {
+            "major_brand": "isom",
+            "minor_version": "512",
+            "compatible_brands": "isomav01iso2mp41",
+            "title": "grav1synth fixture",
+            "encoder": "<normalised>"
+        }
+    }
+}

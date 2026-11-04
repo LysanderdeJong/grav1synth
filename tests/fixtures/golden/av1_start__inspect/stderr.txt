@@ -1,0 +1,1 @@
+ INFO  grav1synth > No film grain headers found--this video does not use grain synthesis

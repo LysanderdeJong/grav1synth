@@ -1,0 +1,3 @@
+ WARN  grav1synth > Videos did not have equal frame counts. Resulting grain table may not be as expected.
+ INFO  grav1synth > Computed diff for 19 frames
+ INFO  grav1synth > Done, wrote output file to out.tbl

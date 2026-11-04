@@ -1,0 +1,1 @@
+Error: HEVC AFGS1 injection does not support chroma_scaling_from_luma; use explicit Cb/Cr scaling points
