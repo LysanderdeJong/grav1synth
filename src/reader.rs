@@ -1,31 +1,26 @@
 use std::{num::NonZeroUsize, path::Path};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use av1_grain::v_frame::{
     chroma::ChromaSubsampling,
     frame::{Frame, FrameBuilder},
     pixel::Pixel,
     plane::Plane,
 };
-use ffmpeg::{
-    Stream,
-    codec::{decoder, packet, threading},
-    format::{self, context::Input},
-    frame, media,
-};
 use num_rational::Rational32;
 use rayon::scope;
 
-use crate::profile::{self, MetricId};
+use crate::{
+    profile::{self, MetricId},
+    tools::{Launcher, MediaInfo, RawFrames, chroma_size, probe},
+};
 
+/// Decoded frames of a file's video stream, read from `ffmpeg -f rawvideo`.
 pub struct BitstreamReader {
-    input_ctx: Input,
-    decoder: decoder::Video,
+    frames: RawFrames,
     video_details: VideoDetails,
-    stream_index: usize,
-    frameno: usize,
-    end_of_stream: bool,
-    eof_sent: bool,
+    info: MediaInfo,
+    buf: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,94 +32,58 @@ pub struct VideoDetails {
     pub frame_rate: Rational32,
 }
 
-impl BitstreamReader {
-    pub fn open<P: AsRef<Path>>(input: P) -> Result<Self> {
-        ffmpeg::init()?;
+/// One raw frame split into its planes.
+struct Planes<'a> {
+    data: [&'a [u8]; 3],
+    stride: [usize; 3],
+}
 
-        let input_ctx = format::input(input.as_ref())?;
-        let stream = input_ctx
-            .streams()
-            .best(media::Type::Video)
-            .ok_or(ffmpeg::Error::StreamNotFound)?;
-        let stream_index = stream.index();
-
-        let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
-        let mut decoder_context = context.decoder();
-        decoder_context.set_threading(threading::Config {
-            kind: threading::Type::Slice,
-            count: 0,
-        });
-        let mut decoder = decoder_context.video()?;
-        decoder.set_parameters(stream.parameters())?;
-
-        let bit_depth = match decoder.format() {
-            format::pixel::Pixel::YUV420P
-            | format::pixel::Pixel::YUV422P
-            | format::pixel::Pixel::YUV444P
-            | format::pixel::Pixel::YUVJ420P
-            | format::pixel::Pixel::YUVJ422P
-            | format::pixel::Pixel::YUVJ444P => 8,
-            format::pixel::Pixel::YUV420P10LE
-            | format::pixel::Pixel::YUV422P10LE
-            | format::pixel::Pixel::YUV444P10LE => 10,
-            format::pixel::Pixel::YUV420P12LE
-            | format::pixel::Pixel::YUV422P12LE
-            | format::pixel::Pixel::YUV444P12LE => 12,
-            fmt => {
-                bail!("unsupported video format {fmt:?}");
-            }
-        };
-
-        let chroma_sampling = match decoder.format() {
-            format::pixel::Pixel::YUV420P
-            | format::pixel::Pixel::YUVJ420P
-            | format::pixel::Pixel::YUV420P10LE
-            | format::pixel::Pixel::YUV420P12LE => ChromaSubsampling::Yuv420,
-            format::pixel::Pixel::YUV422P
-            | format::pixel::Pixel::YUVJ422P
-            | format::pixel::Pixel::YUV422P10LE
-            | format::pixel::Pixel::YUV422P12LE => ChromaSubsampling::Yuv422,
-            format::pixel::Pixel::YUV444P
-            | format::pixel::Pixel::YUVJ444P
-            | format::pixel::Pixel::YUV444P10LE
-            | format::pixel::Pixel::YUV444P12LE => ChromaSubsampling::Yuv444,
-            fmt => {
-                bail!("unsupported video format {fmt:?}");
-            }
-        };
-
-        let mut frame_rate = stream.avg_frame_rate();
-        if frame_rate.denominator() == 0 {
-            frame_rate = stream.rate();
+impl<'a> Planes<'a> {
+    fn split(details: &VideoDetails, buf: &'a [u8]) -> Self {
+        let bytes = if details.bit_depth > 8 { 2 } else { 1 };
+        let (cw, ch) = chroma_size(details.chroma_sampling, details.width, details.height);
+        let y_len = details.width * details.height * bytes;
+        let c_len = cw * ch * bytes;
+        Self {
+            data: [
+                &buf[..y_len],
+                &buf[y_len..y_len + c_len],
+                &buf[y_len + c_len..y_len + 2 * c_len],
+            ],
+            stride: [details.width * bytes, cw * bytes, cw * bytes],
         }
+    }
 
+    const fn data(&self, plane: usize) -> &'a [u8] {
+        self.data[plane]
+    }
+
+    const fn stride(&self, plane: usize) -> usize {
+        self.stride[plane]
+    }
+}
+
+impl BitstreamReader {
+    /// Probe `input` and start decoding its video stream.
+    ///
+    /// # Errors
+    /// Returns probe errors, unsupported pixel formats, and ffmpeg start failures.
+    pub fn open<P: AsRef<Path>>(launcher: &dyn Launcher, input: P) -> Result<Self> {
+        let info = probe(launcher, input.as_ref())?;
+        let (bit_depth, chroma_sampling) = info.pixel_layout()?;
+        let frames = RawFrames::open(launcher, input.as_ref(), &info)?;
         Ok(Self {
+            frames,
             video_details: VideoDetails {
-                width: decoder.width() as usize,
-                height: decoder.height() as usize,
+                width: info.width,
+                height: info.height,
                 bit_depth,
                 chroma_sampling,
-                frame_rate: Rational32::new(frame_rate.numerator(), frame_rate.denominator()),
+                frame_rate: info.frame_rate,
             },
-            input_ctx,
-            decoder,
-            stream_index,
-            frameno: 0,
-            end_of_stream: false,
-            eof_sent: false,
+            info,
+            buf: Vec::new(),
         })
-    }
-
-    pub fn get_video_stream(&self) -> Result<Stream<'_>> {
-        Ok(self
-            .input_ctx
-            .streams()
-            .best(media::Type::Video)
-            .ok_or(ffmpeg::Error::StreamNotFound)?)
-    }
-
-    pub fn input(&mut self) -> &mut Input {
-        &mut self.input_ctx
     }
 
     #[must_use]
@@ -132,102 +91,42 @@ impl BitstreamReader {
         &self.video_details
     }
 
-    pub fn get_frame<T: Pixel>(&mut self) -> Result<Option<Frame<T>>> {
-        loop {
-            let packet = self
-                .input_ctx
-                .packets()
-                .next()
-                .and_then(Result::ok)
-                .map(|(_, pkt)| pkt);
-
-            let mut packet = if let Some(pkt) = packet {
-                pkt
-            } else {
-                self.end_of_stream = true;
-                packet::Packet::empty()
-            };
-
-            if self.end_of_stream && !self.eof_sent {
-                let _ = self.decoder.send_eof();
-                self.eof_sent = true;
-            }
-
-            if self.end_of_stream || packet.stream() == self.stream_index {
-                let mut decoded = frame::Video::empty();
-                packet.set_pts(Some(self.frameno as i64));
-                packet.set_dts(Some(self.frameno as i64));
-
-                if !self.end_of_stream {
-                    let _ = profile::time(MetricId::ReaderSendPacket, || {
-                        self.decoder.send_packet(&packet)
-                    });
-                }
-
-                if profile::time(MetricId::ReaderReceiveFrame, || {
-                    self.decoder.receive_frame(&mut decoded)
-                })
-                .is_ok()
-                {
-                    let frame = decode_frame::<T>(&self.video_details, &decoded)?;
-                    self.frameno += 1;
-                    return Ok(Some(frame));
-                } else if self.end_of_stream {
-                    return Ok(None);
-                }
-            }
-        }
+    /// What ffprobe reported about the file.
+    #[must_use]
+    pub const fn info(&self) -> &MediaInfo {
+        &self.info
     }
 
-    pub fn get_frame_u8(&mut self) -> Result<Option<Frame<u8>>> {
-        loop {
-            let packet = self
-                .input_ctx
-                .packets()
-                .next()
-                .and_then(Result::ok)
-                .map(|(_, pkt)| pkt);
-
-            let mut packet = if let Some(pkt) = packet {
-                pkt
-            } else {
-                self.end_of_stream = true;
-                packet::Packet::empty()
-            };
-
-            if self.end_of_stream && !self.eof_sent {
-                let _ = self.decoder.send_eof();
-                self.eof_sent = true;
-            }
-
-            if self.end_of_stream || packet.stream() == self.stream_index {
-                let mut decoded = frame::Video::empty();
-                packet.set_pts(Some(self.frameno as i64));
-                packet.set_dts(Some(self.frameno as i64));
-
-                if !self.end_of_stream {
-                    let _ = profile::time(MetricId::ReaderSendPacket, || {
-                        self.decoder.send_packet(&packet)
-                    });
-                }
-
-                if profile::time(MetricId::ReaderReceiveFrame, || {
-                    self.decoder.receive_frame(&mut decoded)
-                })
-                .is_ok()
-                {
-                    let frame = decode_frame_u8(&self.video_details, &decoded)?;
-                    self.frameno += 1;
-                    return Ok(Some(frame));
-                } else if self.end_of_stream {
-                    return Ok(None);
-                }
-            }
+    /// The next frame at its native bit depth, or `None` at the end.
+    ///
+    /// # Errors
+    /// Returns decode (ffmpeg) failures.
+    pub fn get_frame<T: Pixel>(&mut self) -> Result<Option<Frame<T>>> {
+        if !profile::time(MetricId::ReaderReceiveFrame, || {
+            self.frames.next_frame(&mut self.buf)
+        })? {
+            return Ok(None);
         }
+        let planes = Planes::split(&self.video_details, &self.buf);
+        decode_frame::<T>(&self.video_details, &planes).map(Some)
+    }
+
+    /// The next frame reduced to 8 bits, or `None` at the end.
+    ///
+    /// # Errors
+    /// Returns decode (ffmpeg) failures.
+    pub fn get_frame_u8(&mut self) -> Result<Option<Frame<u8>>> {
+        if !profile::time(MetricId::ReaderReceiveFrame, || {
+            self.frames.next_frame(&mut self.buf)
+        })? {
+            return Ok(None);
+        }
+        let planes = Planes::split(&self.video_details, &self.buf);
+        decode_frame_u8(&self.video_details, &planes).map(Some)
     }
 }
 
-fn decode_frame<T: Pixel>(details: &VideoDetails, decoded: &frame::Video) -> Result<Frame<T>> {
+fn decode_frame<T: Pixel>(details: &VideoDetails, decoded: &Planes<'_>) -> Result<Frame<T>> {
     let width = details.width;
     let height = details.height;
     let bit_depth = details.bit_depth as u8;
@@ -294,7 +193,7 @@ fn decode_frame<T: Pixel>(details: &VideoDetails, decoded: &frame::Video) -> Res
     Ok(frame)
 }
 
-fn decode_frame_u8(details: &VideoDetails, decoded: &frame::Video) -> Result<Frame<u8>> {
+fn decode_frame_u8(details: &VideoDetails, decoded: &Planes<'_>) -> Result<Frame<u8>> {
     let width = details.width;
     let height = details.height;
 
@@ -376,8 +275,8 @@ fn copy_decoded_plane_to_u8(
     for (row_idx, out_row) in out_plane.rows_mut().enumerate() {
         let src_offset = row_idx * input_stride;
         let src_row = &src[src_offset..src_offset + row_byte_width];
-        for (out, bytes) in out_row.iter_mut().zip(src_row.chunks_exact(2)) {
-            *out = (u16::from_le_bytes([bytes[0], bytes[1]]) >> shift) as u8;
+        for (out, bytes) in out_row.iter_mut().zip(src_row.as_chunks::<2>().0) {
+            *out = (u16::from_le_bytes(*bytes) >> shift) as u8;
         }
     }
 

@@ -1,5 +1,15 @@
 ## Unreleased
 
+- Drop the FFmpeg libraries (`ffmpeg-the-third`): grav1synth now runs the `ffmpeg`/`ffprobe`
+  executables instead. Building needs no FFmpeg headers or libclang. Video packets go to
+  ffmpeg as NUT, so timestamps, B-frame dts, extradata and the other streams, chapters and
+  metadata come out as before. The library API takes a `tools::Launcher`.
+- `apply` and `remove` now update the container's AV1 configuration record (MP4 `av1C`,
+  Matroska `CodecPrivate`) when they turn grain on or off, so its `film_grain_params_present`
+  matches the bitstream.
+- `diff` no longer drops frames when the AV1 decoder holds frames back, and fails on decode
+  and read errors instead of ignoring them.
+- `tests/fixtures`: fixture generator, golden recorder and goldens for parity checks.
 - Support ffmpeg 9.0
 - Merge `apply` and `generate` into a single `apply` command. `--grain <FILE>` applies
   table-based grain; `--iso <NUM>` (with optional `--chroma`) applies photon-noise-based grain.

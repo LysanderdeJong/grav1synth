@@ -3953,8 +3953,6 @@ mod tests {
 
     fn make_parser<const WRITE: bool>() -> BitstreamParser<WRITE> {
         BitstreamParser {
-            reader: None,
-            writer: None,
             packet_out: Vec::new(),
             incoming_grain_header: None,
             parsed: false,
@@ -4652,6 +4650,44 @@ mod tests {
             .unwrap();
         let header = result.unwrap();
         assert_eq!(header.film_grain_params, FilmGrainHeader::Disable);
+    }
+
+    #[test]
+    fn uncompressed_header_write_advances_seed_per_frame_within_segment() {
+        // The grain synthesis spec wants a fresh seed per frame, so every frame in one
+        // segment gets the previous frame's seed plus DEFAULT_GRAIN_SEED.
+        let mut parser = make_parser::<true>();
+        let mut seq = minimal_sequence_header();
+        seq.film_grain_params_present = true;
+        seq.new_film_grain_state = true;
+        parser.sequence_header = Some(seq);
+        let mut grain = minimal_grain_params();
+        grain.grain_seed = 100;
+        parser.incoming_grain_header = Some(vec![GrainTableSegment {
+            start_time: 0,
+            end_time: 1000,
+            grain_params: grain,
+        }]);
+        let seeds: Vec<u16> = [0, 400, 800]
+            .into_iter()
+            .map(|packet_ts| {
+                parser.seen_frame_header = false; // each frame is a new temporal unit
+                let mut bits = build_minimal_key_frame_bits(true);
+                bits.push_bool(false);
+                let (data, _) = with_trailer(bits);
+                let (_, result) = parser
+                    .parse_frame_header(&data, simple_obu_header(), packet_ts, 0, false)
+                    .unwrap();
+                match result.unwrap().film_grain_params {
+                    FilmGrainHeader::UpdateGrain(params) => params.grain_seed,
+                    other => panic!("expected UpdateGrain, got {other:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(
+            seeds,
+            [1, 2, 3].map(|n| 100u16.wrapping_add(DEFAULT_GRAIN_SEED.wrapping_mul(n)))
+        );
     }
 
     // -----------------------------------------------------------------------

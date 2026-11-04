@@ -1,8 +1,12 @@
 //! Library interface for `grav1synth`: film-grain analysis and bitstream editing.
 //!
-//! The command-line binary in `main.rs` is a thin wrapper over [`analyze`] and
-//! [`apply`]. Embedding applications (e.g. `shot-encoder grain`) should call
-//! those entry points directly instead of shelling out to the binary.
+//! The command-line binary in `main.rs` is a thin wrapper over [`analyze`],
+//! [`apply`] and [`remove`]. Embedding applications (e.g. `shot-encoder grain`) should
+//! call those entry points directly instead of shelling out to the binary.
+//!
+//! Decoding, demuxing and muxing are done by the `ffmpeg`/`ffprobe` executables, started
+//! through a [`tools::Launcher`] the caller provides ([`tools::StdLauncher`] runs them from
+//! `PATH`).
 //!
 //! [`analyze`] diffs an untouched source video against a denoised copy and
 //! writes a `filmgrn1` grain table. [`apply`] writes grain metadata from a
@@ -12,10 +16,12 @@
 pub mod filters;
 pub mod hevc;
 pub mod misc;
+pub mod nut;
 pub mod parser;
 pub mod presets;
 pub mod profile;
 pub mod reader;
+pub mod tools;
 
 use std::{
     fs::{File, read_to_string},
@@ -32,11 +38,6 @@ use av1_grain::{
     v_frame::{frame::Frame, pixel::Pixel},
 };
 use crossterm::tty::IsTty;
-use ffmpeg::{
-    codec,
-    ffi::{AVColorRange, AVColorTransferCharacteristic},
-    format,
-};
 use indicatif::{HumanDuration, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 use log::{debug, info, warn};
 use parser::grain::FilmGrainParams;
@@ -44,7 +45,10 @@ use rayon::ThreadPoolBuilder;
 use v_frame_05::pixel::Pixel as Pixel05;
 
 use crate::{
-    filters::FilterChain, misc::get_frame_count, parser::BitstreamParser, reader::BitstreamReader,
+    filters::FilterChain,
+    parser::{BitstreamParser, pts_to_grain_ts},
+    reader::BitstreamReader,
+    tools::{Launcher, MediaInfo, PacketReader, Remuxer, frame_count, probe},
 };
 
 /// A single timestamped run of identical grain parameters, as stored in a
@@ -103,7 +107,10 @@ pub struct AnalyzeReport {
 ///
 /// Unlike the CLI, this never prompts: an existing output without
 /// `overwrite` is an error, and identical input paths are an error.
-pub fn analyze(opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
+///
+/// # Errors
+/// Returns invalid options, ffmpeg/ffprobe failures, decode errors and write errors.
+pub fn analyze(opts: &AnalyzeOptions, launcher: &dyn Launcher) -> Result<AnalyzeReport> {
     if opts.source == opts.output || opts.denoised == opts.output {
         bail!("Input and output paths are the same, which would overwrite an input");
     }
@@ -133,7 +140,7 @@ pub fn analyze(opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
         );
     }
 
-    let frame_count = get_frame_count(&opts.source).ok();
+    let frame_count = frame_count(launcher, &opts.source).ok();
 
     let progress = if stderr().is_tty() {
         let pb = frame_count.map_or_else(
@@ -151,8 +158,8 @@ pub fn analyze(opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
         ProgressBar::hidden()
     };
 
-    let source_reader = BitstreamReader::open(&opts.source)?;
-    let denoised_reader = BitstreamReader::open(&opts.denoised)?;
+    let source_reader = BitstreamReader::open(launcher, &opts.source)?;
+    let denoised_reader = BitstreamReader::open(launcher, &opts.denoised)?;
     let frame_rate = source_reader.get_video_details().frame_rate;
     let source_bd = source_reader.get_video_details().bit_depth;
     let denoised_bd = denoised_reader.get_video_details().bit_depth;
@@ -296,7 +303,11 @@ pub struct ApplyReport {
 ///
 /// Unlike the CLI, this never prompts: an existing output without
 /// `overwrite` is an error, and identical input/output paths are an error.
-pub fn apply(opts: &ApplyOptions) -> Result<ApplyReport> {
+///
+/// # Errors
+/// Returns invalid options, unreadable grain sources, ffmpeg/ffprobe failures, parse errors
+/// and write errors.
+pub fn apply(opts: &ApplyOptions, launcher: &dyn Launcher) -> Result<ApplyReport> {
     if opts.input == opts.output {
         bail!("Input and output paths are the same, which would overwrite the input");
     }
@@ -308,16 +319,16 @@ pub fn apply(opts: &ApplyOptions) -> Result<ApplyReport> {
         );
     }
 
-    let reader = BitstreamReader::open(&opts.input)?;
-    let codec_id = reader.get_video_stream()?.parameters().id();
+    let info = probe(launcher, &opts.input)?;
+    let is_hevc = info.codec == "hevc";
 
-    if codec_id != codec::Id::HEVC {
+    if !is_hevc {
         // Check whether the input already carries AV1 film grain headers.
         // We only need to read the Sequence Header OBU (always in the first video packet)
         // to check the film_grain_params_present flag, so this is effectively instant.
-        let check_reader = BitstreamReader::open(&opts.input)?;
-        let mut check_parser: BitstreamParser<false> = BitstreamParser::new(check_reader);
-        let has_existing_grain = check_parser.film_grain_params_present()?;
+        let mut packets = PacketReader::open(launcher, &opts.input, &info)?;
+        let has_existing_grain = BitstreamParser::new().film_grain_params_present(&mut packets)?;
+        packets.stop();
 
         if has_existing_grain && !opts.replace {
             info!(
@@ -369,32 +380,20 @@ pub fn apply(opts: &ApplyOptions) -> Result<ApplyReport> {
             )
         }
         GrainSource::PhotonNoise(noise) => {
-            // SAFETY: We extract the items we need from the struct within the unsafe
-            // block, so there's no possibility of use-after-free later.
-            let (width, height, trc, range) = unsafe {
-                let video_stream = reader.get_video_stream().unwrap();
-                let params = video_stream.parameters().as_ptr();
-                (
-                    (*params).width as u32,
-                    (*params).height as u32,
-                    (*params).color_trc,
-                    (*params).color_range,
-                )
-            };
             let grain_data = generate_photon_noise_params(
                 0,
                 u64::MAX,
                 av1_grain::NoiseGenArgs {
                     iso_setting: noise.iso,
-                    width,
-                    height,
-                    transfer_function: if trc == AVColorTransferCharacteristic::SMPTE2084 {
+                    width: info.width as u32,
+                    height: info.height as u32,
+                    transfer_function: if info.color_transfer == "smpte2084" {
                         TransferFunction::SMPTE2084
                     } else {
                         TransferFunction::BT1886
                     },
                     chroma_grain: noise.chroma,
-                    full_range: range == AVColorRange::JPEG,
+                    full_range: info.color_range == "pc",
                     random_seed: None,
                 },
             );
@@ -402,8 +401,8 @@ pub fn apply(opts: &ApplyOptions) -> Result<ApplyReport> {
         }
     };
 
-    if codec_id == codec::Id::HEVC {
-        if !opts.replace && hevc::has_hevc_grain(&opts.input)? {
+    if is_hevc {
+        if !opts.replace && hevc::has_hevc_grain(launcher, &opts.input, &info)? {
             info!(
                 "Skipped: HEVC stream already contains x265 AFGS1 SEI. Re-run with replace \
                  enabled to replace the existing grain SEI."
@@ -413,8 +412,10 @@ pub fn apply(opts: &ApplyOptions) -> Result<ApplyReport> {
             });
         }
         hevc::modify_hevc_grain(
+            launcher,
             &opts.input,
             &opts.output,
+            &info,
             new_grain.as_deref(),
             opts.replace,
         )?;
@@ -427,11 +428,7 @@ pub fn apply(opts: &ApplyOptions) -> Result<ApplyReport> {
         });
     }
 
-    let writer = format::output(&opts.output)?;
-
-    let mut parser: BitstreamParser<true> = BitstreamParser::with_writer(reader, writer, new_grain);
-
-    parser.modify_grain_headers()?;
+    modify_av1_grain(launcher, &opts.input, &opts.output, &info, new_grain)?;
 
     info!(
         "Done, wrote output file to {}",
@@ -440,6 +437,124 @@ pub fn apply(opts: &ApplyOptions) -> Result<ApplyReport> {
     Ok(ApplyReport {
         skipped_existing: false,
     })
+}
+
+/// Strip all supported film grain synthesis from an AV1 or HEVC video.
+///
+/// # Errors
+/// Returns identical paths, ffmpeg/ffprobe failures, parse errors and write errors.
+pub fn remove(
+    launcher: &dyn Launcher,
+    input: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<()> {
+    if input == output {
+        bail!("Input and output paths are the same, which would overwrite the input");
+    }
+    let info = probe(launcher, input)?;
+    if info.codec == "hevc" {
+        hevc::modify_hevc_grain(launcher, input, output, &info, None, true)
+    } else {
+        modify_av1_grain(launcher, input, output, &info, None)
+    }
+}
+
+/// Rewrite the film grain headers of an AV1 video to `grain` (`None` removes grain) and
+/// remux the result with the input's other streams.
+///
+/// # Errors
+/// Returns ffmpeg/ffprobe failures, parse errors and write errors.
+pub fn modify_av1_grain(
+    launcher: &dyn Launcher,
+    input: &std::path::Path,
+    output: &std::path::Path,
+    info: &MediaInfo,
+    grain: Option<Vec<GrainTableSegment>>,
+) -> Result<()> {
+    let reader = PacketReader::open(launcher, input, info)?;
+    let timing = reader.timing(info.has_b_frames);
+    let mut remuxer = Remuxer::start(launcher, input, output, info, &timing)?;
+    let mut parser = BitstreamParser::with_grain(grain);
+    let mut extradata = None;
+    for packet in reader {
+        let mut packet = packet?;
+        let packet_ts = pts_to_grain_ts(packet.pts.unwrap_or_default(), info.time_base);
+        packet.data = parser.modify_packet(&packet.data, packet_ts)?;
+        let extradata = extradata
+            .get_or_insert_with(|| av1c_with_sequence_header(&info.extradata, &packet.data));
+        remuxer.write(info, extradata, &packet)?;
+    }
+    remuxer.finish()
+}
+
+/// The AV1 codec configuration record (MP4 `av1C`, Matroska `CodecPrivate`: 4 header bytes
+/// then configOBUs) with its sequence header replaced by the one in `packet`, so the
+/// container's `film_grain_params_present` matches the rewritten bitstream. Returns `av1c`
+/// unchanged when either side has no sequence header to swap.
+fn av1c_with_sequence_header(av1c: &[u8], packet: &[u8]) -> Vec<u8> {
+    const OBU_SEQUENCE_HEADER: u8 = 1;
+    // Each OBU as (type, bytes); `None` when an OBU has no size field and cannot be delimited.
+    fn obus(mut data: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+        let mut out = Vec::new();
+        while let Some(&header) = data.first() {
+            let start = if header & 0x04 == 0 { 1 } else { 2 };
+            if header & 0x02 == 0 {
+                return None;
+            }
+            let (mut size, mut len) = (0usize, 0);
+            loop {
+                let byte = *data.get(start + len)?;
+                size |= usize::from(byte & 0x7f) << (7 * len);
+                len += 1;
+                if byte & 0x80 == 0 || len == 8 {
+                    break;
+                }
+            }
+            let end = (start + len).checked_add(size)?;
+            out.push(((header >> 3) & 0x0f, data.get(..end)?));
+            data = &data[end..];
+        }
+        Some(out)
+    }
+
+    let new_sequence_header = obus(packet)
+        .and_then(|o| o.into_iter().find(|(t, _)| *t == OBU_SEQUENCE_HEADER))
+        .map(|(_, bytes)| bytes);
+    let (Some(new_sequence_header), Some(config_obus)) =
+        (new_sequence_header, av1c.get(4..).and_then(obus))
+    else {
+        return av1c.to_vec();
+    };
+    let grain_flag = |obu: &[u8]| {
+        BitstreamParser::new()
+            .film_grain_params_present([Ok(tools::Packet {
+                data: obu.to_vec(),
+                pts: None,
+                dts: None,
+                duration: 0,
+                key: true,
+            })])
+            .ok()
+    };
+    // Encoders may write av1C's sequence header with other fields than the in-band one, so
+    // only swap it when the grain flag really changed.
+    let old_flag = config_obus
+        .iter()
+        .find(|(t, _)| *t == OBU_SEQUENCE_HEADER)
+        .and_then(|(_, bytes)| grain_flag(bytes));
+    match (old_flag, grain_flag(new_sequence_header)) {
+        (Some(old), Some(new)) if old != new => {}
+        _ => return av1c.to_vec(),
+    }
+    let mut out = av1c[..4].to_vec();
+    for (obu_type, bytes) in config_obus {
+        out.extend_from_slice(if obu_type == OBU_SEQUENCE_HEADER {
+            new_sequence_header
+        } else {
+            bytes
+        });
+    }
+    out
 }
 
 const PROGRESS_CHARS: &str = "█▉▊▋▌▍▎▏  ";
@@ -788,4 +903,53 @@ pub fn write_film_grain_segment(
     writeln!(output)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::av1c_with_sequence_header;
+
+    // SVT-AV1 sequence headers (fixture av1_cfr8): av1C's copy and the in-band one differ in
+    // more than the grain flag (last byte: 0x10 = no grain, 0x30 = film_grain_params_present).
+    const AV1C_HEADER: [u8; 4] = [0x81, 0x00, 0x0c, 0x00];
+    const AV1C_SEQ: [u8; 13] = [
+        0x0a, 0x0b, 0x02, 0x00, 0x00, 0x05, 0x59, 0xbf, 0xc7, 0x00, 0xbe, 0x00, 0x10,
+    ];
+    const INBAND_SEQ: [u8; 13] = [
+        0x0a, 0x0b, 0x02, 0x00, 0x00, 0x05, 0x59, 0xbf, 0xc7, 0x1a, 0xbe, 0x60, 0x10,
+    ];
+    const INBAND_SEQ_GRAIN: [u8; 13] = [
+        0x0a, 0x0b, 0x02, 0x00, 0x00, 0x05, 0x59, 0xbf, 0xc7, 0x1a, 0xbe, 0x60, 0x30,
+    ];
+    const TD: [u8; 2] = [0x12, 0x00];
+
+    fn av1c() -> Vec<u8> {
+        [AV1C_HEADER.as_slice(), &AV1C_SEQ].concat()
+    }
+
+    #[test]
+    fn av1c_takes_the_rewritten_sequence_header_when_grain_changes() {
+        let packet = [TD.as_slice(), &INBAND_SEQ_GRAIN].concat();
+        assert_eq!(
+            av1c_with_sequence_header(&av1c(), &packet),
+            [AV1C_HEADER.as_slice(), &INBAND_SEQ_GRAIN].concat()
+        );
+    }
+
+    #[test]
+    fn av1c_is_kept_when_grain_is_unchanged() {
+        let packet = [TD.as_slice(), &INBAND_SEQ].concat();
+        assert_eq!(av1c_with_sequence_header(&av1c(), &packet), av1c());
+    }
+
+    #[test]
+    fn av1c_is_kept_without_a_sequence_header_to_swap() {
+        assert_eq!(av1c_with_sequence_header(&av1c(), &TD), av1c());
+        assert_eq!(
+            av1c_with_sequence_header(&[], &INBAND_SEQ_GRAIN),
+            Vec::<u8>::new()
+        );
+        // An OBU without a size field cannot be delimited.
+        assert_eq!(av1c_with_sequence_header(&av1c(), &[0x08, 0xcc]), av1c());
+    }
 }

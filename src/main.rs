@@ -11,17 +11,17 @@ use av1_grain::estimate_plane_noise;
 use av1_grain::parse_grain_table;
 use clap::{ArgGroup, Parser, Subcommand};
 use dialoguer::Confirm;
-use ffmpeg::{codec, format};
+#[cfg(feature = "unstable")]
+use grav1synth::reader::BitstreamReader;
 use grav1synth::{
     AnalyzeOptions, ApplyOptions, GrainSource, GrainTableSegment, PhotonNoiseOptions, analyze,
     apply, hevc,
-    misc::get_frame_count,
     parser::{
         BitstreamParser,
         grain::{FilmGrainHeader, FilmGrainParams},
     },
-    presets,
-    reader::BitstreamReader,
+    presets, remove, tools,
+    tools::StdLauncher,
     write_film_grain_segment,
 };
 use log::{error, info, warn};
@@ -67,9 +67,9 @@ pub fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let reader = BitstreamReader::open(&input)?;
-            if reader.get_video_stream()?.parameters().id() == codec::Id::HEVC {
-                let grain_tables = hevc::inspect_hevc_grain_table(&input)?;
+            let info = tools::probe(&StdLauncher, &input)?;
+            if info.codec == "hevc" {
+                let grain_tables = hevc::inspect_hevc_grain_table(&StdLauncher, &input, &info)?;
                 if grain_tables.is_empty() {
                     info!(
                         "No x265 AFGS1 film grain SEI found--this video does not use supported HEVC grain synthesis"
@@ -87,9 +87,12 @@ pub fn main() -> Result<()> {
                 info!("Done, wrote grain table to {}", output.to_string_lossy());
                 return Ok(());
             }
-            let frame_rate = reader.get_video_details().frame_rate;
-            let mut parser: BitstreamParser<false> = BitstreamParser::new(reader);
-            let grain_headers = parser.get_grain_headers()?;
+            let frame_rate = info.frame_rate;
+            let mut parser = BitstreamParser::new();
+            let grain_headers = parser.get_grain_headers(
+                tools::PacketReader::open(&StdLauncher, &input, &info)?,
+                info.time_base,
+            )?;
 
             if !grain_headers
                 .iter()
@@ -135,13 +138,16 @@ pub fn main() -> Result<()> {
                     "clap ArgGroup enforces exactly one of --grain, --preset, or --iso"
                 ),
             };
-            apply(&ApplyOptions {
-                input,
-                output,
-                overwrite,
-                source,
-                replace,
-            })?;
+            apply(
+                &ApplyOptions {
+                    input,
+                    output,
+                    overwrite,
+                    source,
+                    replace,
+                },
+                &StdLauncher,
+            )?;
         }
         Commands::Presets => {
             println!("Built-in film grain presets (use with `apply --preset <NAME>`):\n");
@@ -203,17 +209,7 @@ pub fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let reader = BitstreamReader::open(&input)?;
-            if reader.get_video_stream()?.parameters().id() == codec::Id::HEVC {
-                hevc::modify_hevc_grain(&input, &output, None, true)?;
-                info!("Done, wrote output file to {}", output.to_string_lossy());
-                return Ok(());
-            }
-            let writer = format::output(&output)?;
-            let mut parser: BitstreamParser<true> =
-                BitstreamParser::with_writer(reader, writer, None);
-
-            parser.modify_grain_headers()?;
+            remove(&StdLauncher, &input, &output)?;
 
             info!("Done, wrote output file to {}", output.to_string_lossy());
         }
@@ -225,14 +221,17 @@ pub fn main() -> Result<()> {
             filters,
             threads,
         } => {
-            analyze(&AnalyzeOptions {
-                source,
-                denoised,
-                output,
-                overwrite,
-                filters,
-                threads,
-            })?;
+            analyze(
+                &AnalyzeOptions {
+                    source,
+                    denoised,
+                    output,
+                    overwrite,
+                    filters,
+                    threads,
+                },
+                &StdLauncher,
+            )?;
         }
         Commands::X265Aom {
             grain,
@@ -275,9 +274,9 @@ pub fn main() -> Result<()> {
 
             let (frame_count, frame_rate) = match (video, frames, fps) {
                 (Some(video), None, None) => {
-                    let frame_count = get_frame_count(&video)?;
-                    let reader = BitstreamReader::open(&video)?;
-                    (frame_count, Some(reader.get_video_details().frame_rate))
+                    let frame_count = tools::frame_count(&StdLauncher, &video)?;
+                    let info = tools::probe(&StdLauncher, &video)?;
+                    (frame_count, Some(info.frame_rate))
                 }
                 (None, Some(frame_count), fps) => {
                     let frame_rate = fps.as_deref().map(parse_fps).transpose()?;
@@ -338,7 +337,7 @@ pub fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let mut reader = BitstreamReader::open(&source)?;
+            let mut reader = BitstreamReader::open(&StdLauncher, &source)?;
             let bit_depth = reader.get_video_details().bit_depth;
             let mut frame_estimates = Vec::new();
 
@@ -365,13 +364,6 @@ pub fn main() -> Result<()> {
                     }
                 }
             }
-
-            let video_stream = reader.get_video_stream().unwrap();
-            // SAFETY: We immediately dereference the pointer to get the contained struct,
-            // so there's no possibility of use-after-free later.
-            let video_params = unsafe { *video_stream.parameters().as_ptr() };
-            let frame_rate = reader.get_video_details().frame_rate;
-            let trc = video_params.color_trc;
 
             let mut output_file = BufWriter::new(File::create(&output)?);
             writeln!(&mut output_file, "filmgrn1")?;
