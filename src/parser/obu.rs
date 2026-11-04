@@ -513,8 +513,6 @@ mod tests {
         packet_out: Vec<u8>,
     ) -> BitstreamParser<WRITE> {
         BitstreamParser {
-            reader: None,
-            writer: None,
             packet_out,
             incoming_grain_header: None,
             parsed: false,

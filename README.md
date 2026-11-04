@@ -9,11 +9,15 @@ Grain Synth analyzer and editor for AV1 files, with HEVC/x265 AFGS1 SEI injectio
 ## Build
 
 - Prerequisites:
-  - ffmpeg headers
   - Rust compiler
 - Pull the repo
 - Run `cargo build --release`
 - Copy the binary from `target/release/grav1synth` to wherever you want
+
+At runtime grav1synth needs the `ffmpeg` and `ffprobe` executables on `PATH` (FFmpeg 7 or
+newer). It does not link FFmpeg's libraries, so building needs no FFmpeg headers, libclang or
+pkg-config. Library users pass their own `tools::Launcher` to decide how those executables are
+started.
 
 ## Usage
 

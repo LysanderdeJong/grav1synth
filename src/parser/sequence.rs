@@ -1037,8 +1037,6 @@ mod tests {
         incoming_grain_header: Option<Vec<GrainTableSegment>>,
     ) -> BitstreamParser<WRITE> {
         BitstreamParser {
-            reader: None,
-            writer: None,
             packet_out: Vec::new(),
             incoming_grain_header,
             parsed: false,

@@ -1,0 +1,2 @@
+ INFO  grav1synth > Computed diff for 20 frames
+ INFO  grav1synth > Done, wrote output file to out.tbl

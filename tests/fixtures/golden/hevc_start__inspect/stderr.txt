@@ -1,0 +1,1 @@
+ INFO  grav1synth > No x265 AFGS1 film grain SEI found--this video does not use supported HEVC grain synthesis

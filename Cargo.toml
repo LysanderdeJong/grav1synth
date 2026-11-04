@@ -22,9 +22,6 @@ bitvec = "1.0.1"
 clap = { version = "4.0.2", features = ["derive"] }
 crossterm = "0.29.0"
 dialoguer = "0.12.0"
-ffmpeg = { version = "6.0.0", default-features = false, features = [
-    "format",
-], package = "ffmpeg-the-third" }
 indicatif = "0.18"
 log = "0.4.17"
 nom = "8.0.0"
@@ -44,7 +41,6 @@ tempfile = "3.3.0"
 
 [features]
 default = []
-ffmpeg_static = ["ffmpeg/static", "ffmpeg/build"]
 unstable = ["av1-grain/unstable"]
 profile-diff = []
 dav1d_tests = []

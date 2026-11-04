@@ -1,0 +1,1 @@
+ INFO  grav1synth > Done, wrote grain table to out.tbl

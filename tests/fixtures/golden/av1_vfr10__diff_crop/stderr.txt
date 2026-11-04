@@ -1,0 +1,1 @@
+Error: Luma resolutions were not equal, 120x64 != 128x72
