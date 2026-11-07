@@ -94,6 +94,11 @@ pub struct AnalyzeOptions {
     /// A caller-owned bar to advance once per analyzed frame. The caller sets its length and
     /// draw target. `None` draws grav1synth's own bar on a terminal stderr.
     pub progress: Option<ProgressBar>,
+    /// Frame indices where shots start. The table then gets one segment per shot; `None`
+    /// splits segments where the measured noise changes.
+    pub shot_starts: Option<Vec<usize>>,
+    /// Taste controls applied to the estimated table before it is written.
+    pub shaping: Shaping,
 }
 
 /// Outcome of [`analyze`].
@@ -101,6 +106,95 @@ pub struct AnalyzeOptions {
 pub struct AnalyzeReport {
     /// Number of frame pairs the grain table was computed from.
     pub frames: usize,
+    /// Number of segments in the written table.
+    pub segments: usize,
+    /// Frames that gave no noise estimate (too few flat blocks); their segment uses the
+    /// estimate from its other frames.
+    pub frames_without_estimate: usize,
+}
+
+/// Taste controls for a grain table. The default changes nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Shaping {
+    /// Drop colour grain: only luma gets grain.
+    pub luma_only: bool,
+    /// Fade grain above 8-bit level `start` down to a quarter of its strength at `end`.
+    pub highlight_rolloff: Option<(u8, u8)>,
+    /// Drop the AR shaping filter, giving uncorrelated (finest) grain.
+    pub no_shaping: bool,
+}
+
+/// Grain strength left at and above the highlight roll-off end.
+const ROLLOFF_FLOOR: f64 = 0.25;
+
+/// Apply `shaping` to every segment of a grain table.
+pub fn shape_segments(segments: &mut [GrainTableSegment], shaping: &Shaping) {
+    for params in segments.iter_mut().map(|segment| &mut segment.grain_params) {
+        if shaping.luma_only {
+            params.scaling_points_cb.clear();
+            params.scaling_points_cr.clear();
+            params.chroma_scaling_from_luma = false;
+        }
+        if let Some((start, end)) = shaping.highlight_rolloff {
+            roll_off(&mut params.scaling_points_y, start, end);
+            roll_off(&mut params.scaling_points_cb, start, end);
+            roll_off(&mut params.scaling_points_cr, start, end);
+        }
+        if shaping.no_shaping {
+            params.ar_coeff_lag = 0;
+            params.ar_coeffs_y.clear();
+            // Chroma keeps only its last coefficient, the correlation with luma.
+            for coeffs in [&mut params.ar_coeffs_cb, &mut params.ar_coeffs_cr] {
+                let luma_corr = coeffs.last().copied().unwrap_or(0);
+                coeffs.clear();
+                coeffs.push(luma_corr);
+            }
+        }
+    }
+}
+
+/// Scale a piecewise-linear scaling function by a gain that is 1 up to `start` and falls
+/// linearly to [`ROLLOFF_FLOOR`] at `end`. `start` and `end` become points (when there is
+/// room), so the faded curve keeps its shape between them.
+fn roll_off<const N: usize>(points: &mut arrayvec::ArrayVec<[u8; 2], N>, start: u8, end: u8) {
+    let Some((&first, &last)) = points.first().zip(points.last()) else {
+        return;
+    };
+    let value_at = |x: u8| -> f64 {
+        if x <= first[0] {
+            return f64::from(first[1]);
+        }
+        points
+            .windows(2)
+            .find(|pair| x <= pair[1][0])
+            .map_or(f64::from(last[1]), |pair| {
+                let (x0, y0) = (f64::from(pair[0][0]), f64::from(pair[0][1]));
+                let (x1, y1) = (f64::from(pair[1][0]), f64::from(pair[1][1]));
+                y0 + (y1 - y0) * (f64::from(x) - x0) / (x1 - x0).max(1.0)
+            })
+    };
+    let gain = |x: u8| -> f64 {
+        if x <= start {
+            1.0
+        } else if x >= end {
+            ROLLOFF_FLOOR
+        } else {
+            1.0 - (1.0 - ROLLOFF_FLOOR) * f64::from(x - start) / f64::from(end - start)
+        }
+    };
+    let mut xs: Vec<u8> = points.iter().map(|point| point[0]).collect();
+    for x in [start, end] {
+        if xs.len() < N && !xs.contains(&x) {
+            xs.push(x);
+        }
+    }
+    xs.sort_unstable();
+    let faded: Vec<[u8; 2]> = xs
+        .into_iter()
+        .map(|x| [x, (value_at(x) * gain(x)).round() as u8])
+        .collect();
+    points.clear();
+    points.extend(faded);
 }
 
 /// Generate a film grain table by diffing a source video against a denoised copy.
@@ -178,6 +272,9 @@ pub fn analyze(opts: &AnalyzeOptions, launcher: &dyn Launcher) -> Result<Analyze
         differ_source_bd,
         differ_denoised_bd,
     );
+    if let Some(shot_starts) = &opts.shot_starts {
+        differ.set_boundaries(shot_starts.clone());
+    }
     let non_zero_source_bd =
         NonZeroU8::new(source_bd as u8).ok_or_else(|| anyhow!("bd should not be 0"))?;
 
@@ -235,12 +332,18 @@ pub fn analyze(opts: &AnalyzeOptions, launcher: &dyn Launcher) -> Result<Analyze
     )?;
     progress.finish_using_style();
 
-    let grain_tables = profile::time(profile::MetricId::DifferFinish, || differ.finish());
+    let frames_without_estimate = differ.frames_without_estimate();
+    let mut grain_tables: Vec<GrainTableSegment> =
+        profile::time(profile::MetricId::DifferFinish, || differ.finish())
+            .into_iter()
+            .map(Into::into)
+            .collect();
+    shape_segments(&mut grain_tables, &opts.shaping);
     profile::time(profile::MetricId::OutputWrite, || -> Result<()> {
         let mut output_file = BufWriter::new(File::create(&opts.output)?);
         writeln!(&mut output_file, "filmgrn1")?;
-        for segment in grain_tables {
-            write_film_grain_segment(&segment.into(), &mut output_file)?;
+        for segment in &grain_tables {
+            write_film_grain_segment(segment, &mut output_file)?;
         }
         output_file.flush()?;
         Ok(())
@@ -251,7 +354,14 @@ pub fn analyze(opts: &AnalyzeOptions, launcher: &dyn Launcher) -> Result<Analyze
         "Done, wrote output file to {}",
         opts.output.to_string_lossy()
     );
-    Ok(AnalyzeReport { frames })
+    if frames_without_estimate > 0 {
+        warn!("{frames_without_estimate} of {frames} frames gave no noise estimate");
+    }
+    Ok(AnalyzeReport {
+        frames,
+        segments: grain_tables.len(),
+        frames_without_estimate,
+    })
 }
 
 /// Where the grain applied by [`apply`] comes from.
@@ -289,6 +399,8 @@ pub struct ApplyOptions {
     /// Overwrite grain metadata already present in the input. Without this,
     /// inputs that already carry grain are skipped and reported.
     pub replace: bool,
+    /// Taste controls applied to the grain before it is written.
+    pub shaping: Shaping,
 }
 
 /// Outcome of [`apply`].
@@ -404,6 +516,11 @@ pub fn apply(opts: &ApplyOptions, launcher: &dyn Launcher) -> Result<ApplyReport
             Some(vec![grain_data.into()])
         }
     };
+
+    let mut new_grain = new_grain;
+    if let Some(segments) = &mut new_grain {
+        shape_segments(segments, &opts.shaping);
+    }
 
     if is_hevc {
         if !opts.replace && hevc::has_hevc_grain(launcher, &opts.input, &info)? {
@@ -912,7 +1029,93 @@ pub fn write_film_grain_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::av1c_with_sequence_header;
+    use super::{GrainTableSegment, Shaping, av1c_with_sequence_header, shape_segments};
+
+    const TABLE: &str = "filmgrn1
+E 0 10000000 1 7391 1
+	p 3 7 0 10 0 1 128 192 256 128 192 256
+	sY 3  0 40 128 40 255 40
+	sCb 2 0 20 255 20
+	sCr 2 0 20 255 20
+	cY 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24
+	cCb 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
+	cCr 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 26
+";
+
+    fn shaped(shaping: Shaping) -> GrainTableSegment {
+        let mut segments: Vec<GrainTableSegment> = av1_grain::parse_grain_table(TABLE)
+            .expect("valid table")
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        shape_segments(&mut segments, &shaping);
+        // The shaped table must still be a valid table.
+        let path =
+            std::env::temp_dir().join(format!("grav1synth-shape-{}.tbl", std::process::id()));
+        {
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&path).expect("create"));
+            std::io::Write::write_all(
+                &mut out,
+                b"filmgrn1
+",
+            )
+            .expect("write");
+            super::write_film_grain_segment(&segments[0], &mut out).expect("write");
+        }
+        let text = std::fs::read_to_string(&path).expect("read");
+        std::fs::remove_file(&path).ok();
+        av1_grain::parse_grain_table(&text).expect("shaped table parses");
+        segments.remove(0)
+    }
+
+    #[test]
+    fn default_shaping_changes_nothing() {
+        let params = shaped(Shaping::default()).grain_params;
+        assert_eq!(
+            params.scaling_points_y.as_slice(),
+            &[[0, 40], [128, 40], [255, 40]]
+        );
+        assert_eq!(params.ar_coeffs_y.len(), 24);
+        assert_eq!(params.scaling_points_cb.len(), 2);
+    }
+
+    #[test]
+    fn luma_only_drops_colour_points() {
+        let params = shaped(Shaping {
+            luma_only: true,
+            ..Shaping::default()
+        })
+        .grain_params;
+        assert!(params.scaling_points_cb.is_empty());
+        assert!(params.scaling_points_cr.is_empty());
+        assert_eq!(params.scaling_points_y.len(), 3);
+    }
+
+    #[test]
+    fn highlight_rolloff_fades_to_a_quarter() {
+        let params = shaped(Shaping {
+            highlight_rolloff: Some((180, 240)),
+            ..Shaping::default()
+        })
+        .grain_params;
+        assert_eq!(
+            params.scaling_points_y.as_slice(),
+            &[[0, 40], [128, 40], [180, 40], [240, 10], [255, 10]]
+        );
+    }
+
+    #[test]
+    fn no_shaping_drops_the_ar_filter_but_keeps_luma_correlation() {
+        let params = shaped(Shaping {
+            no_shaping: true,
+            ..Shaping::default()
+        })
+        .grain_params;
+        assert_eq!(params.ar_coeff_lag, 0);
+        assert!(params.ar_coeffs_y.is_empty());
+        assert_eq!(params.ar_coeffs_cb.as_slice(), &[25]);
+        assert_eq!(params.ar_coeffs_cr.as_slice(), &[26]);
+    }
 
     // SVT-AV1 sequence headers (fixture av1_cfr8): av1C's copy and the in-band one differ in
     // more than the grain flag (last byte: 0x10 = no grain, 0x30 = film_grain_params_present).

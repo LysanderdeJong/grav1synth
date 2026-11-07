@@ -91,7 +91,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 [[package]]
 name = "av1-grain"
 version = "0.5.0"
-source = "git+https://github.com/LysanderdeJong/av1-grain.git?rev=f615ca944afe6c7c93c028c7ce292e09233f1709#f615ca944afe6c7c93c028c7ce292e09233f1709"
+source = "git+https://github.com/LysanderdeJong/av1-grain.git?rev=f277a2ea423ec4c6d00f2f40b3761082dd45a3f4#f277a2ea423ec4c6d00f2f40b3761082dd45a3f4"
 dependencies = [
  "anyhow",
  "arrayvec",
