@@ -124,6 +124,22 @@ pub struct Shaping {
     pub no_shaping: bool,
 }
 
+/// AV1 with 4:2:0 forbids scaling points on one chroma plane only; decoders reject such frame
+/// headers.
+fn check_chroma_pairs(segments: &[GrainTableSegment]) -> Result<()> {
+    if let Some(segment) = segments.iter().find(|segment| {
+        let params = &segment.grain_params;
+        !params.chroma_scaling_from_luma
+            && params.scaling_points_cb.is_empty() != params.scaling_points_cr.is_empty()
+    }) {
+        bail!(
+            "grain table segment at {:.3} s has scaling points on only one chroma plane, which AV1              does not allow for 4:2:0 video; re-run analyze, or apply with luma_only",
+            segment.start_time as f64 / 1e7
+        );
+    }
+    Ok(())
+}
+
 /// Grain strength left at and above the highlight roll-off end.
 const ROLLOFF_FLOOR: f64 = 0.25;
 
@@ -520,6 +536,9 @@ pub fn apply(opts: &ApplyOptions, launcher: &dyn Launcher) -> Result<ApplyReport
     let mut new_grain = new_grain;
     if let Some(segments) = &mut new_grain {
         shape_segments(segments, &opts.shaping);
+        if !is_hevc && info.pix_fmt.contains("420") {
+            check_chroma_pairs(segments)?;
+        }
     }
 
     if is_hevc {
@@ -1082,6 +1101,19 @@ E 0 10000000 1 7391 1
         );
         assert_eq!(params.ar_coeffs_y.len(), 24);
         assert_eq!(params.scaling_points_cb.len(), 2);
+    }
+
+    #[test]
+    fn one_plane_chroma_tables_are_rejected() {
+        let mut segment = shaped(Shaping::default());
+        assert!(super::check_chroma_pairs(std::slice::from_ref(&segment)).is_ok());
+        segment.grain_params.scaling_points_cr.clear();
+        assert!(super::check_chroma_pairs(std::slice::from_ref(&segment)).is_err());
+        let luma_only = shaped(Shaping {
+            luma_only: true,
+            ..Shaping::default()
+        });
+        assert!(super::check_chroma_pairs(&[luma_only]).is_ok());
     }
 
     #[test]
