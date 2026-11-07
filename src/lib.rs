@@ -1050,8 +1050,13 @@ E 0 10000000 1 7391 1
             .collect();
         shape_segments(&mut segments, &shaping);
         // The shaped table must still be a valid table.
-        let path =
-            std::env::temp_dir().join(format!("grav1synth-shape-{}.tbl", std::process::id()));
+        // Tests run in parallel, so each call needs its own file.
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "grav1synth-shape-{}-{call}.tbl",
+            std::process::id()
+        ));
         {
             let mut out = std::io::BufWriter::new(std::fs::File::create(&path).expect("create"));
             std::io::Write::write_all(
