@@ -91,6 +91,9 @@ pub struct AnalyzeOptions {
     /// Number of Rayon worker threads for grain analysis. `None` keeps the
     /// default global pool. A pool that is already initialized is left as-is.
     pub threads: Option<usize>,
+    /// A caller-owned bar to advance once per analyzed frame. The caller sets its length and
+    /// draw target. `None` draws grav1synth's own bar on a terminal stderr.
+    pub progress: Option<ProgressBar>,
 }
 
 /// Outcome of [`analyze`].
@@ -140,9 +143,10 @@ pub fn analyze(opts: &AnalyzeOptions, launcher: &dyn Launcher) -> Result<Analyze
         );
     }
 
-    let frame_count = frame_count(launcher, &opts.source).ok();
-
-    let progress = if stderr().is_tty() {
+    let progress = if let Some(progress) = &opts.progress {
+        progress.clone()
+    } else if stderr().is_tty() {
+        let frame_count = frame_count(launcher, &opts.source).ok();
         let pb = frame_count.map_or_else(
             || ProgressBar::new(0).with_style(spinner_style()),
             |frame_count| ProgressBar::new(frame_count as u64).with_style(pretty_progress_style()),
@@ -229,7 +233,7 @@ pub fn analyze(opts: &AnalyzeOptions, launcher: &dyn Launcher) -> Result<Analyze
             }
         },
     )?;
-    progress.finish();
+    progress.finish_using_style();
 
     let grain_tables = profile::time(profile::MetricId::DifferFinish, || differ.finish());
     profile::time(profile::MetricId::OutputWrite, || -> Result<()> {
