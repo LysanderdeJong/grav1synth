@@ -229,6 +229,7 @@ pub fn main() -> Result<()> {
                     overwrite,
                     filters,
                     threads,
+                    progress: None,
                 },
                 &StdLauncher,
             )?;
