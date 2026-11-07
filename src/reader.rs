@@ -272,13 +272,34 @@ fn copy_decoded_plane_to_u8(
         });
     }
 
+    let half = (1u16 << shift) >> 1;
     for (row_idx, out_row) in out_plane.rows_mut().enumerate() {
         let src_offset = row_idx * input_stride;
         let src_row = &src[src_offset..src_offset + row_byte_width];
         for (out, bytes) in out_row.iter_mut().zip(src_row.as_chunks::<2>().0) {
-            *out = (u16::from_le_bytes(*bytes) >> shift) as u8;
+            // Round, don't truncate: truncation shifts every sample down by half a step.
+            *out = ((u16::from_le_bytes(*bytes) + half) >> shift).min(255) as u8;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use av1_grain::v_frame::{chroma::ChromaSubsampling, frame::FrameBuilder};
+
+    use super::copy_decoded_plane_to_u8;
+
+    #[test]
+    fn ten_bit_samples_round_to_eight_bit() {
+        let mut frame = FrameBuilder::new(4, 2, ChromaSubsampling::Monochrome, 8)
+            .build::<u8>()
+            .expect("valid frame");
+        let samples: [u16; 8] = [0, 1, 2, 5, 6, 513, 1022, 1023];
+        let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+        copy_decoded_plane_to_u8(&bytes, 8, &mut frame.y_plane, 2).expect("copy");
+        let out: Vec<u8> = frame.y_plane.pixels().collect();
+        assert_eq!(out, [0, 0, 1, 1, 2, 128, 255, 255]);
+    }
 }

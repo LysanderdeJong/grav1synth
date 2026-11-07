@@ -1,2 +1,3 @@
  INFO  grav1synth > Computed diff for 20 frames
  INFO  grav1synth > Done, wrote output file to out.tbl
+ WARN  grav1synth > 20 of 20 frames gave no noise estimate

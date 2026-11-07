@@ -14,8 +14,8 @@ use dialoguer::Confirm;
 #[cfg(feature = "unstable")]
 use grav1synth::reader::BitstreamReader;
 use grav1synth::{
-    AnalyzeOptions, ApplyOptions, GrainSource, GrainTableSegment, PhotonNoiseOptions, analyze,
-    apply, hevc,
+    AnalyzeOptions, ApplyOptions, GrainSource, GrainTableSegment, PhotonNoiseOptions, Shaping,
+    analyze, apply, hevc,
     parser::{
         BitstreamParser,
         grain::{FilmGrainHeader, FilmGrainParams},
@@ -145,6 +145,7 @@ pub fn main() -> Result<()> {
                     overwrite,
                     source,
                     replace,
+                    shaping: Shaping::default(),
                 },
                 &StdLauncher,
             )?;
@@ -220,7 +221,9 @@ pub fn main() -> Result<()> {
             overwrite,
             filters,
             threads,
+            shots,
         } => {
+            let shot_starts = shots.map(|path| read_shot_starts(&path)).transpose()?;
             analyze(
                 &AnalyzeOptions {
                     source,
@@ -230,6 +233,8 @@ pub fn main() -> Result<()> {
                     filters,
                     threads,
                     progress: None,
+                    shot_starts,
+                    shaping: Shaping::default(),
                 },
                 &StdLauncher,
             )?;
@@ -516,6 +521,20 @@ fn write_u16_le<W: Write>(output: &mut W, value: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Shot start frame indices, one per line; blank lines are skipped.
+fn read_shot_starts(path: &std::path::Path) -> anyhow::Result<Vec<usize>> {
+    std::fs::read_to_string(path)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.parse().map_err(|error| {
+                anyhow!("{}: invalid frame index {line:?}: {error}", path.display())
+            })
+        })
+        .collect()
+}
+
 fn parse_fps(value: &str) -> anyhow::Result<Rational32> {
     if let Some((numer, denom)) = value.split_once('/') {
         let numer = numer.parse::<i32>()?;
@@ -712,6 +731,10 @@ pub enum Commands {
         /// Defaults to Rayon's normal thread count when omitted.
         #[clap(long)]
         threads: Option<usize>,
+        /// A file with the frame index of each shot start, one per line. The table then
+        /// gets one segment per shot instead of splitting where the noise changes.
+        #[clap(long, value_parser)]
+        shots: Option<PathBuf>,
     },
     /// Convert a `filmgrn1` table into x265's binary `--aom-film-grain` input.
     ///
