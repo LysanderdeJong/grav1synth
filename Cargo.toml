@@ -16,7 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1.0.55"
 arrayvec = "0.7.2"
-av1-grain = { git = "https://github.com/LysanderdeJong/av1-grain.git", rev = "7ea7fd9818e5bcb999bea1e2531cef3feac0b70b" }
+av1-grain = { git = "https://github.com/LysanderdeJong/av1-grain.git", rev = "3b21f35d87e271f7c3d85502e51b021f963f076f" }
 bit = "0.1.1"
 bitvec = "1.0.1"
 clap = { version = "4.0.2", features = ["derive"] }
